@@ -1,0 +1,31 @@
+[package]
+name = "bztree"
+version = "0.1.0"
+authors = ["Igor Skokov"]
+edition = "2018"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Lagrang/bztree-rs"
+documentation = "https://docs.rs/bztree"
+description = "BzTree implementation for Rust"
+keywords = ["concurrent", "btree", "tree"]
+categories = ["concurrency", "data-structures"]
+include = ["src/", "LICENSE", "README.md", "CHANGELOG.md"]
+
+[dependencies]
+mwcas = "0.1.0"
+crossbeam-epoch = "0.9.4"
+
+[dev-dependencies]
+rand = "0.8.3"
+crossbeam-utils = "0.8.4"
+num_cpus = "1.11.1"
+criterion = "0.3.4"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "bztree_bench"
+harness = false
+
