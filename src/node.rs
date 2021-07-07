@@ -3,33 +3,32 @@ use crossbeam_epoch::Guard;
 use mwcas::{HeapPointer, MwCas, U64Pointer};
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::HashSet;
-use std::fmt::{Debug, Display, Formatter};
-use std::hash::Hash;
+use std::collections::BTreeSet;
+use std::fmt::{Display, Formatter};
 use std::mem::MaybeUninit;
 use std::ops::RangeBounds;
 use std::option::Option::Some;
 use std::{mem, ptr};
 
 /// BzTree node.
-pub struct Node<K: Ord + Hash, V> {
+pub struct Node<K: Ord, V> {
     status_word: HeapPointer<StatusWord>,
     sorted_len: usize,
     data_block: Vec<Entry<K, V>>,
 }
 
-impl<K: Ord + Hash, V> Node<K, V> {
+impl<K: Ord, V> Node<K, V> {
     /// Create empty node which can hold up to `max_elements`.
     pub fn with_capacity(max_elements: u16) -> Self
     where
-        K: Clone + Ord + Hash,
+        K: Clone + Ord,
     {
         Self::init_with_capacity(Vec::new(), max_elements)
     }
 
     pub fn from(mut sorted_elements: Vec<(K, V)>) -> Self
     where
-        K: Clone + Ord + Hash,
+        K: Clone + Ord,
         V: Clone + Send + Sync,
     {
         if sorted_elements.len() > u16::MAX as usize {
@@ -99,7 +98,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
         guard: &'g Guard,
     ) -> Result<(), InsertError<V>>
     where
-        K: Ord + Hash,
+        K: Ord,
         V: Send + Sync,
     {
         let node_ptr = self as *const Node<K, V>;
@@ -122,7 +121,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
         guard: &'g Guard,
     ) -> Result<Option<&'g V>, InsertError<V>>
     where
-        K: Ord + Hash,
+        K: Ord,
         V: Send + Sync,
     {
         let node_ptr = self as *const Node<K, V>;
@@ -144,7 +143,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
         guard: &'g Guard,
     ) -> Result<Option<&'g V>, InsertError<V>>
     where
-        K: Ord + Hash,
+        K: Ord,
         V: Send + Sync,
     {
         match self.insert_phase_one(key, value, true, cur_status, guard) {
@@ -388,7 +387,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
 
     pub fn range<'g, Q, Range>(&'g self, key_range: Range, guard: &'g Guard) -> Scanner<K, V>
     where
-        K: Hash + Ord + Borrow<Q> + Debug,
+        K: Ord + Borrow<Q>,
         Q: Ord + 'g,
         Range: RangeBounds<Q> + 'g,
     {
@@ -397,7 +396,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
 
     pub fn iter<'g>(&'g self, guard: &'g Guard) -> Scanner<K, V>
     where
-        K: Hash + Ord + Debug,
+        K: Ord,
     {
         self.range(.., guard)
     }
@@ -527,7 +526,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
 
     pub fn split_leaf(&self, guard: &Guard) -> SplitMode<K, V>
     where
-        K: Clone + Ord + Hash + Debug,
+        K: Clone + Ord,
         V: Clone,
     {
         debug_assert!(
@@ -555,7 +554,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
 
     pub fn split_interim(&self, guard: &Guard) -> SplitMode<K, V>
     where
-        K: Clone + Ord + Hash + Debug,
+        K: Clone + Ord,
         V: Clone + Send + Sync,
     {
         debug_assert!(
@@ -581,7 +580,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
         guard: &Guard,
     ) -> MergeMode<K, V>
     where
-        K: Clone + Ord + Hash + Debug,
+        K: Clone + Ord,
         V: Clone,
     {
         debug_assert!(
@@ -636,7 +635,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
         guard: &Guard,
     ) -> MergeMode<K, V>
     where
-        K: Clone + Ord + Hash + Debug,
+        K: Clone + Ord,
         V: Clone + Send + Sync,
     {
         debug_assert!(
@@ -703,7 +702,7 @@ impl<K: Ord + Hash, V> Node<K, V> {
     #[inline(always)]
     pub fn exact_len(&self) -> usize
     where
-        K: Ord + Hash + Debug,
+        K: Ord,
     {
         self.iter(&crossbeam_epoch::pin()).count()
     }
@@ -978,13 +977,13 @@ impl<K: Ord + Hash, V> Node<K, V> {
     }
 }
 
-impl<K: Ord + Hash, V> Drop for Node<K, V> {
+impl<K: Ord, V> Drop for Node<K, V> {
     fn drop(&mut self) {
         // BzTree drops node only when no threads can access it:
         // node removed from tree structure and all threads which
         // perform tree scan already completed.
         let guard = unsafe { crossbeam_epoch::unprotected() };
-        let mut already_scanned = HashSet::new();
+        let mut already_scanned = BTreeSet::new();
         for entry in self.data_block.drain(..).rev() {
             let metadata: Metadata = entry.metadata.read(guard).into();
             if metadata.visible_or_deleted() {
@@ -999,12 +998,12 @@ impl<K: Ord + Hash, V> Drop for Node<K, V> {
     }
 }
 
-unsafe impl<K: Ord + Hash, V> Sync for Node<K, V> {}
-unsafe impl<K: Ord + Hash, V> Send for Node<K, V> {}
+unsafe impl<K: Ord, V> Sync for Node<K, V> {}
+unsafe impl<K: Ord, V> Send for Node<K, V> {}
 
 impl<K, V> Display for Node<K, V>
 where
-    K: Clone + Ord + Hash + Display + Debug,
+    K: Clone + Ord + Display,
     V: Display + Send + Sync,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -1087,7 +1086,7 @@ impl<K, V> Entry<K, V> {
     }
 }
 
-pub struct Scanner<'a, K: Ord + Hash, V> {
+pub struct Scanner<'a, K: Ord, V> {
     node: &'a Node<K, V>,
     // BzTree node can allocate maximum u16::MAX records,
     // use u16 instead of usize to reduce size of scanner
@@ -1098,7 +1097,7 @@ pub struct Scanner<'a, K: Ord + Hash, V> {
 
 impl<'a, K, V> Scanner<'a, K, V>
 where
-    K: Ord + Hash,
+    K: Ord,
 {
     fn new<Q>(
         status_word: &StatusWord,
@@ -1107,11 +1106,11 @@ where
         guard: &'a Guard,
     ) -> Self
     where
-        K: Borrow<Q> + Debug,
+        K: Borrow<Q>,
         Q: Ord,
     {
         let mut kvs: Vec<u16> = Vec::with_capacity(status_word.reserved_records() as usize);
-        let mut scanned_keys = HashSet::with_capacity(status_word.reserved_records() as usize);
+        let mut scanned_keys = BTreeSet::new();
 
         // use reversed iterator because unsorted part at end of KV block has most recent values
         for i in (0..status_word.reserved_records() as usize).rev() {
@@ -1184,7 +1183,7 @@ where
     }
 }
 
-impl<'a, K: Ord + Hash, V> Iterator for Scanner<'a, K, V> {
+impl<'a, K: Ord, V> Iterator for Scanner<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1208,7 +1207,7 @@ impl<'a, K: Ord + Hash, V> Iterator for Scanner<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord + Hash, V> DoubleEndedIterator for Scanner<'a, K, V> {
+impl<'a, K: Ord, V> DoubleEndedIterator for Scanner<'a, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.rev_idx >= self.fwd_idx {
             let index = self.kv_indexes[self.rev_idx as usize] as usize;
@@ -1228,13 +1227,13 @@ impl<'a, K: Ord + Hash, V> DoubleEndedIterator for Scanner<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord + Hash, V> ExactSizeIterator for Scanner<'a, K, V> {
+impl<'a, K: Ord, V> ExactSizeIterator for Scanner<'a, K, V> {
     fn len(&self) -> usize {
         self.size_hint().0
     }
 }
 
-pub enum MergeMode<K: Ord + Hash, V> {
+pub enum MergeMode<K: Ord, V> {
     /// Merge completed successfully. Returns new node which contains
     /// elements of both source nodes.
     NewNode(Node<K, V>),
@@ -1242,7 +1241,7 @@ pub enum MergeMode<K: Ord + Hash, V> {
     MergeFailed,
 }
 
-pub enum SplitMode<K: Ord + Hash, V> {
+pub enum SplitMode<K: Ord, V> {
     /// Overflow node was split into 2 nodes
     Split(Node<K, V>, Node<K, V>),
     /// Node overflow happened because of too many updates
@@ -2032,7 +2031,7 @@ mod tests {
     fn check_scan<R, T>(node: &Node<T, T>, range: R, expected_size: usize)
     where
         R: RangeBounds<T> + Clone,
-        T: PartialOrd<T> + Hash + Ord + Debug,
+        T: PartialOrd<T> + Ord + Debug,
     {
         let guard = crossbeam_epoch::pin();
         let scanner: Vec<(&T, &T)> = node.range(range.clone(), &guard).collect();

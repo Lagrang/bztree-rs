@@ -5,8 +5,34 @@
 //! in-memory(not persistent) data structure.  
 //! BzTree uses [MwCAS](https://crates.io/crates/mwcas) crate to get access to multi-word CAS.
 //!
-//! # Usage
+//! /// # Usage
+//! ```
+//! use bztree::BzTree;
 //!
+//! let mut tree = BzTree::with_node_size(2);
+//! let guard = crossbeam_epoch::pin();
+//!
+//! let key1 = "key_1".to_string();
+//! assert!(tree.insert(key1.clone(), 1, &crossbeam_epoch::pin()));
+//! assert!(!tree.insert(key1.clone(), 5, &crossbeam_epoch::pin()));
+//! tree.upsert(key1.clone(), 10, &crossbeam_epoch::pin());
+//!
+//! assert!(matches!(tree.delete(&key1, &guard), Some(&10)));
+//!
+//! let key2 = "key_2".to_string();
+//! tree.insert(key2.clone(), 2, &crossbeam_epoch::pin());
+//! assert!(tree.compute(&key2, |(_, v)| Some(v + 1), &guard));
+//! assert!(matches!(tree.get(&key2, &guard), Some(&3)));
+//!
+//! assert!(tree.compute(&key2, |(_, v)| {
+//!     if *v == 3 {
+//!         None
+//!     } else {
+//!         Some(v + 1)
+//!     }
+//! }, &guard));
+//! assert!(matches!(tree.get(&key2, &guard), None));
+//! ```
 
 mod node;
 mod scanner;
@@ -18,8 +44,6 @@ use crossbeam_epoch::Guard;
 use mwcas::{HeapPointer, MwCas};
 use status_word::StatusWord;
 use std::borrow::Borrow;
-use std::fmt::{Debug, Display, Formatter};
-use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::option::Option::Some;
 use std::ptr;
@@ -59,39 +83,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// # Thread safety
 /// BzTree can be safely shared between threads, e.g. it implements [Send] ans [Sync].
 ///
-/// # Usage
-/// ```
-/// use bztree::BzTree;
-///
-/// let mut tree = BzTree::with_node_size(2);
-/// let guard = crossbeam_epoch::pin();
-///
-/// assert!(tree.insert("key_1".to_string(), 1, &crossbeam_epoch::pin()));
-/// assert!(!tree.insert("key_1".to_string(), 5, &crossbeam_epoch::pin()));
-///
-/// tree.upsert("key_1".to_string(), 10, &crossbeam_epoch::pin());
-/// assert!(matches!(tree.delete(&"key_1", &guard), Some(&10)));
-///
-/// tree.insert("key_2".to_string(), 2, &crossbeam_epoch::pin());
-/// assert!(tree.compute(&"key_2", |(_, v)| Some(v + 1), &guard));
-/// assert!(matches!(tree.get(&"key_2", &guard), Some(&3)));
-///
-/// assert!(tree.compute(&"key_2", |(_, v)| {
-///     if *v == 3 {
-///         None
-///     } else {
-///         Some(v + 1)
-///     }
-/// }, &guard));
-/// assert!(matches!(tree.get(&"key_2", &guard), None));
-/// ```
-pub struct BzTree<K: Ord + Hash + Debug, V> {
+pub struct BzTree<K: Ord, V> {
     root: HeapPointer<NodePointer<K, V>>,
     node_size: usize,
 }
 
-unsafe impl<K: Ord + Hash + Debug, V> Send for BzTree<K, V> {}
-unsafe impl<K: Ord + Hash + Debug, V> Sync for BzTree<K, V> {}
+unsafe impl<K: Ord, V> Send for BzTree<K, V> {}
+unsafe impl<K: Ord, V> Sync for BzTree<K, V> {}
 
 /// Leaf node of tree actually store KV pairs.
 type LeafNode<K, V> = Node<K, V>;
@@ -105,7 +103,7 @@ type InterimNode<K, V> = Node<Key<K>, HeapPointer<NodePointer<K, V>>>;
 
 impl<K, V> BzTree<K, V>
 where
-    K: Clone + Ord + Hash + Debug,
+    K: Clone + Ord,
     V: Clone + Send + Sync,
 {
     /// Create new tree with default node size.
@@ -197,7 +195,7 @@ where
     pub fn delete<'g, Q>(&'g mut self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
-        Q: Debug + Ord + Clone
+        Q: Ord + Clone,
     {
         loop {
             // use raw pointer to overcome borrowing rules in loop
@@ -221,7 +219,7 @@ where
     pub fn get<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
-        Q: Clone + Ord + Debug,
+        Q: Clone + Ord,
     {
         self.find_leaf(&key, guard)
             .get(&key, guard)
@@ -307,7 +305,7 @@ where
     pub fn compute<Q, F>(&mut self, key: &Q, mut new_val: F, guard: &Guard) -> bool
     where
         K: Borrow<Q>,
-        Q: Ord + Clone + Debug,
+        Q: Ord + Clone,
         F: FnMut((&K, &V)) -> Option<V>,
     {
         loop {
@@ -363,7 +361,7 @@ where
     fn merge_recursive<Q>(&mut self, key: &Q, guard: &Guard)
     where
         K: Borrow<Q>,
-        Q: Debug + Ord + Clone
+        Q: Ord + Clone,
     {
         loop {
             let path = self.find_node_for_key(key, guard);
@@ -887,7 +885,7 @@ where
             guard: &Guard,
         ) -> Option<InterimNode<K, V>>
         where
-            K: Clone + Ord + Hash + Debug,
+            K: Clone + Ord,
         {
             let node_len = parent_node.estimated_len();
             if node_len == max_node_size {
@@ -974,7 +972,7 @@ where
     ) -> TraversePath<'g, K, V>
     where
         K: Borrow<Q>,
-        Q: Clone + Ord + Debug,
+        Q: Clone + Ord,
     {
         let search_key = Key::new(search_key.clone());
         self.find_path_to_key(&search_key, guard)
@@ -988,7 +986,7 @@ where
     ) -> TraversePath<'g, K, V>
     where
         K: Borrow<Q>,
-        Q: Ord + Debug,
+        Q: Ord,
     {
         let mut parents = Vec::new();
         let mut next_node: &HeapPointer<NodePointer<K, V>> = &self.root;
@@ -1025,7 +1023,7 @@ where
     ) -> &'g mut LeafNode<K, V>
     where
         K: Borrow<Q>,
-        Q: Clone + Ord + Debug,
+        Q: Clone + Ord,
     {
         let search_key = Key::new(search_key.clone());
         let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
@@ -1048,7 +1046,7 @@ where
     fn find_leaf<'g, Q>(&'g self, search_key: &Q, guard: &'g Guard) -> &'g LeafNode<K, V>
     where
         K: Borrow<Q>,
-        Q: Clone + Ord + Debug,
+        Q: Clone + Ord,
     {
         let search_key = Key::new(search_key.clone());
         let mut next_node: &NodePointer<K, V> = self.root.read(guard);
@@ -1070,7 +1068,7 @@ where
     fn find_leaf_ptr<'g, Q>(&'g mut self, search_key: &Q, guard: &'g Guard) -> *mut LeafNode<K, V>
     where
         K: Borrow<Q>,
-        Q: Debug + Ord + Clone
+        Q: Ord + Clone,
     {
         let search_key = Key::new(search_key.clone());
         let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
@@ -1092,7 +1090,7 @@ where
 
 impl<K, V> Default for BzTree<K, V>
 where
-    K: Clone + Ord + Hash + Debug,
+    K: Clone + Ord,
     V: Clone + Send + Sync,
 {
     fn default() -> Self {
@@ -1100,19 +1098,19 @@ where
     }
 }
 
-enum MergeResult<'g, K: Ord + Hash + Debug, V> {
+enum MergeResult<'g, K: Ord, V> {
     Completed,
     RecursiveMerge(TraversePath<'g, K, V>),
     Retry,
 }
 
-enum SplitResult<K: Ord + Hash + Debug, V> {
+enum SplitResult<K: Ord, V> {
     Split(NodePointer<K, V>),
     Compacted(NodePointer<K, V>),
     ParentOverflow,
 }
 
-struct TraversePath<'g, K: Ord + Hash + Debug, V> {
+struct TraversePath<'g, K: Ord, V> {
     /// Node pointer of this node inside parent(used by MwCAS).
     cas_pointer: &'g HeapPointer<NodePointer<K, V>>,
     /// Pointer to found node inside tree(read from CAS pointer during traversal)
@@ -1121,12 +1119,12 @@ struct TraversePath<'g, K: Ord + Hash + Debug, V> {
     parents: Vec<Parent<'g, K, V>>,
 }
 
-struct ArcLeafNode<K: Ord + Hash, V> {
+struct ArcLeafNode<K: Ord, V> {
     ref_cnt: *mut AtomicUsize,
     node: *mut LeafNode<K, V>,
 }
 
-impl<K: Ord + Hash, V> ArcLeafNode<K, V> {
+impl<K: Ord, V> ArcLeafNode<K, V> {
     fn new(leaf: LeafNode<K, V>) -> Self {
         ArcLeafNode {
             ref_cnt: Box::into_raw(Box::new(AtomicUsize::new(1))),
@@ -1135,7 +1133,7 @@ impl<K: Ord + Hash, V> ArcLeafNode<K, V> {
     }
 }
 
-impl<K: Ord + Hash, V> Deref for ArcLeafNode<K, V> {
+impl<K: Ord, V> Deref for ArcLeafNode<K, V> {
     type Target = LeafNode<K, V>;
 
     fn deref(&self) -> &Self::Target {
@@ -1143,13 +1141,13 @@ impl<K: Ord + Hash, V> Deref for ArcLeafNode<K, V> {
     }
 }
 
-impl<K: Ord + Hash, V> DerefMut for ArcLeafNode<K, V> {
+impl<K: Ord, V> DerefMut for ArcLeafNode<K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.node }
     }
 }
 
-impl<K: Ord + Hash, V> Clone for ArcLeafNode<K, V> {
+impl<K: Ord, V> Clone for ArcLeafNode<K, V> {
     fn clone(&self) -> Self {
         unsafe {
             let prev = (*self.ref_cnt).fetch_add(1, Ordering::AcqRel);
@@ -1162,7 +1160,7 @@ impl<K: Ord + Hash, V> Clone for ArcLeafNode<K, V> {
     }
 }
 
-impl<K: Ord + Hash, V> Drop for ArcLeafNode<K, V> {
+impl<K: Ord, V> Drop for ArcLeafNode<K, V> {
     fn drop(&mut self) {
         unsafe {
             let prev = (*self.ref_cnt).fetch_sub(1, Ordering::AcqRel);
@@ -1174,15 +1172,15 @@ impl<K: Ord + Hash, V> Drop for ArcLeafNode<K, V> {
     }
 }
 
-unsafe impl<K: Ord + Hash, V> Send for ArcLeafNode<K, V> {}
-unsafe impl<K: Ord + Hash, V> Sync for ArcLeafNode<K, V> {}
+unsafe impl<K: Ord, V> Send for ArcLeafNode<K, V> {}
+unsafe impl<K: Ord, V> Sync for ArcLeafNode<K, V> {}
 
-struct ArcInterimNode<K: Ord + Hash + Debug, V> {
+struct ArcInterimNode<K: Ord, V> {
     ref_cnt: *mut AtomicUsize,
     node: *mut InterimNode<K, V>,
 }
 
-impl<K: Ord + Hash + Debug, V> ArcInterimNode<K, V> {
+impl<K: Ord, V> ArcInterimNode<K, V> {
     fn new(interim: InterimNode<K, V>) -> Self {
         ArcInterimNode {
             ref_cnt: Box::into_raw(Box::new(AtomicUsize::new(1))),
@@ -1191,7 +1189,7 @@ impl<K: Ord + Hash + Debug, V> ArcInterimNode<K, V> {
     }
 }
 
-impl<K: Ord + Hash + Debug, V> Deref for ArcInterimNode<K, V> {
+impl<K: Ord, V> Deref for ArcInterimNode<K, V> {
     type Target = InterimNode<K, V>;
 
     fn deref(&self) -> &Self::Target {
@@ -1199,13 +1197,13 @@ impl<K: Ord + Hash + Debug, V> Deref for ArcInterimNode<K, V> {
     }
 }
 
-impl<K: Ord + Hash + Debug, V> DerefMut for ArcInterimNode<K, V> {
+impl<K: Ord, V> DerefMut for ArcInterimNode<K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.node }
     }
 }
 
-impl<K: Ord + Hash + Debug, V> Clone for ArcInterimNode<K, V> {
+impl<K: Ord, V> Clone for ArcInterimNode<K, V> {
     fn clone(&self) -> Self {
         unsafe {
             let prev = (*self.ref_cnt).fetch_add(1, Ordering::AcqRel);
@@ -1218,7 +1216,7 @@ impl<K: Ord + Hash + Debug, V> Clone for ArcInterimNode<K, V> {
     }
 }
 
-impl<K: Ord + Hash + Debug, V> Drop for ArcInterimNode<K, V> {
+impl<K: Ord, V> Drop for ArcInterimNode<K, V> {
     fn drop(&mut self) {
         unsafe {
             let prev = (*self.ref_cnt).fetch_sub(1, Ordering::AcqRel);
@@ -1230,15 +1228,15 @@ impl<K: Ord + Hash + Debug, V> Drop for ArcInterimNode<K, V> {
     }
 }
 
-unsafe impl<K: Ord + Hash + Debug, V> Send for ArcInterimNode<K, V> {}
-unsafe impl<K: Ord + Hash + Debug, V> Sync for ArcInterimNode<K, V> {}
+unsafe impl<K: Ord, V> Send for ArcInterimNode<K, V> {}
+unsafe impl<K: Ord, V> Sync for ArcInterimNode<K, V> {}
 
-enum NodePointer<K: Ord + Hash + Debug, V> {
+enum NodePointer<K: Ord, V> {
     Leaf(ArcLeafNode<K, V>),
     Interim(ArcInterimNode<K, V>),
 }
 
-impl<K: Ord + Hash + Clone + Debug, V> Clone for NodePointer<K, V> {
+impl<K: Ord + Clone, V> Clone for NodePointer<K, V> {
     fn clone(&self) -> Self {
         match self {
             NodePointer::Leaf(node) => NodePointer::Leaf(node.clone()),
@@ -1247,10 +1245,10 @@ impl<K: Ord + Hash + Clone + Debug, V> Clone for NodePointer<K, V> {
     }
 }
 
-unsafe impl<K: Ord + Hash + Debug, V> Send for NodePointer<K, V> {}
-unsafe impl<K: Ord + Hash + Debug, V> Sync for NodePointer<K, V> {}
+unsafe impl<K: Ord, V> Send for NodePointer<K, V> {}
+unsafe impl<K: Ord, V> Sync for NodePointer<K, V> {}
 
-impl<K: Ord + Hash + Debug, V> NodePointer<K, V> {
+impl<K: Ord, V> NodePointer<K, V> {
     #[inline]
     fn new_leaf(node: LeafNode<K, V>) -> NodePointer<K, V> {
         let leaf_node = ArcLeafNode::new(node);
@@ -1274,7 +1272,7 @@ impl<K: Ord + Hash + Debug, V> NodePointer<K, V> {
     #[inline]
     fn len(&self) -> usize
     where
-        K: Ord + Hash + Debug,
+        K: Ord,
     {
         match self {
             NodePointer::Leaf(node) => node.exact_len(),
@@ -1331,7 +1329,7 @@ impl<K> Key<K> {
     }
 }
 
-impl<K: Ord + Debug> Ord for Key<K> {
+impl<K: Ord> Ord for Key<K> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match &self.key {
             Some(key) => match &other.key {
@@ -1347,7 +1345,7 @@ impl<K: Ord + Debug> Ord for Key<K> {
 }
 
 /// Impl used by [`Node`] to find siblings or closest node to some other node.
-impl<K: Borrow<Q> + Debug, Q: Ord + Debug> PartialOrd<Key<Q>> for Key<K> {
+impl<K: Borrow<Q>, Q: Ord> PartialOrd<Key<Q>> for Key<K> {
     fn partial_cmp(&self, other: &Key<Q>) -> Option<std::cmp::Ordering> {
         match &self.key {
             Some(key) => match &other.key {
@@ -1373,28 +1371,7 @@ impl<K: Borrow<Q>, Q: Eq> PartialEq<Key<Q>> for Key<K> {
     }
 }
 
-impl<K: Hash> Hash for Key<K> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match &self.key {
-            Some(key) => key.hash(state),
-            None => state.write_usize(0),
-        }
-    }
-}
-
-impl<K: Display> Display for Key<K> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.key
-                .as_ref()
-                .map_or_else(|| String::from("+Inf"), |k| k.to_string())
-        )
-    }
-}
-
-struct Parent<'a, K: Ord + Hash + Debug, V> {
+struct Parent<'a, K: Ord, V> {
     /// Node pointer of this parent inside grandparent(used by MwCAS).
     cas_pointer: &'a HeapPointer<NodePointer<K, V>>,
     /// Parent node pointer inside grandparent at moment of tree traversal(actual value read from
@@ -1404,7 +1381,7 @@ struct Parent<'a, K: Ord + Hash + Debug, V> {
     child_key: Key<K>,
 }
 
-impl<'a, K: Ord + Hash + Debug, V> Parent<'a, K, V> {
+impl<'a, K: Ord, V> Parent<'a, K, V> {
     fn node(&self) -> &InterimNode<K, V> {
         self.node_pointer.to_interim_node()
     }

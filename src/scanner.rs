@@ -3,36 +3,34 @@ use crate::{InterimNode, Key, LeafNode, NodePointer};
 use crossbeam_epoch::Guard;
 use mwcas::HeapPointer;
 use std::borrow::Borrow;
-use std::fmt::Debug;
-use std::hash::Hash;
 use std::ops::{Bound, RangeBounds};
 use std::option::Option::Some;
 
-pub struct Scanner<'g, K: Ord + Hash + Debug, V, Range> {
+pub struct Scanner<'g, K: Ord, V, Range> {
     forward: Iter<'g, K, V>,
     reversed: Iter<'g, K, V>,
     range: Range,
     guard: &'g Guard,
 }
 
-struct Iter<'g, K: Ord + Hash + Debug, V> {
+struct Iter<'g, K: Ord, V> {
     interims: Vec<node::Scanner<'g, Key<K>, HeapPointer<NodePointer<K, V>>>>,
     iter: Option<node::Scanner<'g, K, V>>,
     last_key: Option<&'g K>,
 }
 
-impl<'g, K: Ord + Hash + Debug, V> Iter<'g, K, V> {
+impl<'g, K: Ord, V> Iter<'g, K, V> {
     fn clear(&mut self) {
         self.iter = None;
         self.interims.clear();
     }
 }
 
-impl<'g, K: Ord + Hash + Debug, V, Range> Scanner<'g, K, V, Range> {
+impl<'g, K: Ord, V, Range> Scanner<'g, K, V, Range> {
     pub fn from_leaf_root<Q>(root: &'g LeafNode<K, V>, key_range: Range, guard: &'g Guard) -> Self
     where
         Range: RangeBounds<Q> + Clone + 'g,
-        K: Clone + Borrow<Q> + Ord + Hash + Debug,
+        K: Clone + Borrow<Q> + Ord,
         V: Send + Sync,
         Q: Ord + 'g,
     {
@@ -59,7 +57,7 @@ impl<'g, K: Ord + Hash + Debug, V, Range> Scanner<'g, K, V, Range> {
     ) -> Self
     where
         Range: RangeBounds<K> + Clone + 'g,
-        K: Ord + Hash + Clone + Debug,
+        K: Ord + Clone,
         V: Send + Sync,
     {
         // interim root node always contains +Inf key which contains nodes with keys greater than
@@ -84,7 +82,7 @@ impl<'g, K: Ord + Hash + Debug, V, Range> Scanner<'g, K, V, Range> {
     fn next_leaf(&mut self) -> Option<node::Scanner<'g, K, V>>
     where
         Range: RangeBounds<K> + Clone + 'g,
-        K: Ord + Hash + Clone + Debug,
+        K: Ord + Clone,
     {
         let range_check = KeyRange::from(self.range.clone());
         while let Some(nodes) = self.forward.interims.last_mut() {
@@ -126,7 +124,7 @@ impl<'g, K: Ord + Hash + Debug, V, Range> Scanner<'g, K, V, Range> {
     fn next_leaf_rev(&mut self) -> Option<node::Scanner<'g, K, V>>
     where
         Range: RangeBounds<K> + Clone + 'g,
-        K: Ord + Hash + Clone + Debug,
+        K: Ord + Clone,
     {
         while let Some(nodes) = self.reversed.interims.last_mut() {
             if let Some((key, node_ptr)) = nodes.next_back() {
@@ -176,7 +174,7 @@ impl<'g, K: Ord + Hash + Debug, V, Range> Scanner<'g, K, V, Range> {
     #[inline(always)]
     fn intersects(range: &(Bound<&Key<K>>, Bound<&Key<K>>), intersects_with: &KeyRange<K>) -> bool
     where
-        K: Ord + Debug,
+        K: Ord,
     {
         let res = match range.start_bound() {
             Bound::Excluded(key) | Bound::Included(key) => intersects_with.contains(key),
@@ -200,7 +198,7 @@ impl<'g, K: Ord + Hash + Debug, V, Range> Scanner<'g, K, V, Range> {
 impl<'g, K, V, Range> Iterator for Scanner<'g, K, V, Range>
 where
     Range: RangeBounds<K> + Clone + 'g,
-    K: Ord + Hash + Clone + Debug,
+    K: Ord + Clone,
     V: Send + Sync,
 {
     type Item = (&'g K, &'g V);
@@ -247,7 +245,7 @@ where
 impl<'g, K, V, Range> DoubleEndedIterator for Scanner<'g, K, V, Range>
 where
     Range: RangeBounds<K> + Clone + 'g,
-    K: Ord + Hash + Clone + Debug,
+    K: Ord + Clone,
     V: Send + Sync,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
