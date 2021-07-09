@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use rand::prelude::*;
@@ -8,6 +8,7 @@ use rand::seq::SliceRandom;
 
 use crate::history_verifier::{History, Ops};
 use bztree::BzTree;
+use crossbeam_utils::thread;
 use std::fmt::Debug;
 use std::hash::Hash;
 
@@ -15,7 +16,7 @@ mod history_verifier;
 
 fn test<F, TreeSupplier, K, V>(tree_creator: TreeSupplier, test: F)
 where
-    F: Fn(&AtomicPtr<BzTree<K, V>>, usize, usize),
+    F: Fn(&BzTree<K, V>, usize, usize),
     K: Clone + Ord + Hash + Debug,
     V: Send + Sync,
     TreeSupplier: Fn(usize) -> BzTree<K, V>,
@@ -26,9 +27,8 @@ where
         let threads = cpus * mult;
         let node_size = thread_rng().gen_range(50..100);
         println!("Node size: {}", node_size);
-        let mut bz_tree = tree_creator(node_size);
-        let tree_ptr = AtomicPtr::new(&mut bz_tree);
-        test(&tree_ptr, threads, per_thread_changes);
+        let bz_tree = tree_creator(node_size);
+        test(&bz_tree, threads, per_thread_changes);
     }
 }
 
@@ -37,12 +37,11 @@ fn insert_of_non_overlaping_keys_and_search() {
     test(
         |size| BzTree::<String, usize>::with_node_size(size as u16),
         |tree, threads, shard_size: usize| {
-            crossbeam_utils::thread::scope(|scope| {
+            thread::scope(|scope| {
                 for id in 0..threads {
                     scope.spawn(move |_| {
                         let thread_id = id;
                         let base = shard_size * thread_id;
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         let mut keys: Vec<usize> = (base..base + shard_size).collect();
                         keys.shuffle(&mut thread_rng());
                         for i in keys {
@@ -81,12 +80,11 @@ fn upsert_of_overlaping_keys() {
                 per_thread_elem_set.push(elems);
             }
 
-            let history = crossbeam_utils::thread::scope(|scope| {
+            let history = thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for elems in &per_thread_elem_set {
                     handles.push(scope.spawn(move |_| {
                         let mut ops = Ops::new();
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         for i in elems {
                             let guard = crossbeam_epoch::pin();
                             let key = i.to_string();
@@ -108,7 +106,6 @@ fn upsert_of_overlaping_keys() {
             })
             .unwrap();
 
-            let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
             let guard = crossbeam_epoch::pin();
             history.run_check(|key| tree.get(key, &guard));
         },
@@ -130,12 +127,11 @@ fn add_and_delete() {
                 per_thread_elem_set.push(indexes);
             }
 
-            let history = crossbeam_utils::thread::scope(|scope| {
+            let history = thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for elems in &per_thread_elem_set {
                     handles.push(scope.spawn(move |_| {
                         let mut ops = Ops::new();
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         for i in elems {
                             let guard = crossbeam_epoch::pin();
                             let key = i.to_string();
@@ -165,7 +161,6 @@ fn add_and_delete() {
             })
             .unwrap();
 
-            let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
             let guard = crossbeam_epoch::pin();
             history.run_check(|key| tree.get(key, &guard));
         },
@@ -177,11 +172,10 @@ fn key_search() {
     test(
         |size| BzTree::<String, usize>::with_node_size(size as u16),
         |tree, threads, changes| {
-            crossbeam_utils::thread::scope(|scope| {
+            thread::scope(|scope| {
                 let mut keys: Vec<usize> = (0..changes * threads).collect();
                 keys.shuffle(&mut thread_rng());
                 for i in keys {
-                    let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                     let guard = crossbeam_epoch::pin();
                     let key = i.to_string();
                     let value = i;
@@ -190,7 +184,6 @@ fn key_search() {
 
                 for thread_id in 0..threads {
                     scope.spawn(move |_| {
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         let base = changes * thread_id;
                         for i in base..base + changes {
                             let key = i.to_string();
@@ -217,7 +210,6 @@ fn overlapped_inserts_and_deletes() {
             let max = (threads - 1) * changes + changes;
             let mid = max / 2;
             for thread_id in 0..threads {
-                let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                 let guard = crossbeam_epoch::pin();
                 let mut keys: Vec<usize> =
                     (thread_id * changes..thread_id * changes + changes).collect();
@@ -227,9 +219,8 @@ fn overlapped_inserts_and_deletes() {
                 }
             }
 
-            crossbeam_utils::thread::scope(|scope| {
+            thread::scope(|scope| {
                 scope.spawn(move |_| {
-                    let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                     for i in min..max {
                         let guard = crossbeam_epoch::pin();
                         tree.insert(i.to_string(), i.to_string(), &guard);
@@ -242,7 +233,6 @@ fn overlapped_inserts_and_deletes() {
                 });
 
                 scope.spawn(move |_| {
-                    let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                     for i in (min..max).rev() {
                         let guard = crossbeam_epoch::pin();
                         tree.insert(i.to_string(), i.to_string(), &guard);
@@ -255,7 +245,6 @@ fn overlapped_inserts_and_deletes() {
                 });
 
                 scope.spawn(move |_| {
-                    let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                     for i in min..mid {
                         let guard = crossbeam_epoch::pin();
                         tree.insert(i.to_string(), i.to_string(), &guard);
@@ -267,7 +256,6 @@ fn overlapped_inserts_and_deletes() {
                 });
 
                 scope.spawn(move |_| {
-                    let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                     for i in (mid..max).rev() {
                         let guard = crossbeam_epoch::pin();
                         tree.insert(i.to_string(), i.to_string(), &guard);
@@ -279,7 +267,6 @@ fn overlapped_inserts_and_deletes() {
                 });
 
                 scope.spawn(move |_| {
-                    let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                     for i in (min..mid).rev() {
                         let guard = crossbeam_epoch::pin();
                         tree.insert(i.to_string(), i.to_string(), &guard);
@@ -291,7 +278,6 @@ fn overlapped_inserts_and_deletes() {
                 });
 
                 scope.spawn(move |_| {
-                    let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                     for i in mid..max {
                         let guard = crossbeam_epoch::pin();
                         tree.insert(i.to_string(), i.to_string(), &guard);
@@ -304,7 +290,6 @@ fn overlapped_inserts_and_deletes() {
             })
             .unwrap();
 
-            let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
             assert!(tree.iter(&crossbeam_epoch::pin()).next().is_none());
         },
     );
@@ -332,11 +317,10 @@ fn scan() {
                 );
             }
 
-            crossbeam_utils::thread::scope(|scope| {
+            thread::scope(|scope| {
                 for thread_id in 0..threads {
                     let state = thread_checkpoint.get(&thread_id).unwrap();
                     scope.spawn(move |_| {
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         for i in state.val_range.clone() {
                             let guard = crossbeam_epoch::pin();
                             let key = i;
@@ -357,89 +341,80 @@ fn scan() {
                     let state = thread_checkpoint.get(&thread_id).unwrap();
 
                     // check forward scan
-                    scope.spawn(move |_| {
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
-                        loop {
-                            let guard = crossbeam_epoch::pin();
-                            let last_written_val = state.last_written_value.load(Ordering::Acquire);
-                            let scanned: Vec<i64> = tree
-                                .range(state.val_range.clone(), &guard)
-                                .map(|(_, v)| *v)
-                                .collect();
-                            let expected: Vec<i64> =
-                                (state.val_range.start..=last_written_val).collect();
-                            assert!(
-                                scanned.starts_with(&expected),
-                                "scanned: {:?}, expected: {:?}; Range: {:?}---{:?}",
-                                scanned,
-                                expected,
-                                state.val_range,
-                                (state.val_range.start..=last_written_val)
-                            );
+                    scope.spawn(move |_| loop {
+                        let guard = crossbeam_epoch::pin();
+                        let last_written_val = state.last_written_value.load(Ordering::Acquire);
+                        let scanned: Vec<i64> = tree
+                            .range(state.val_range.clone(), &guard)
+                            .map(|(_, v)| *v)
+                            .collect();
+                        let expected: Vec<i64> =
+                            (state.val_range.start..=last_written_val).collect();
+                        assert!(
+                            scanned.starts_with(&expected),
+                            "scanned: {:?}, expected: {:?}; Range: {:?}---{:?}",
+                            scanned,
+                            expected,
+                            state.val_range,
+                            (state.val_range.start..=last_written_val)
+                        );
 
-                            if state.val_range.end == last_written_val + 1 {
-                                break;
-                            }
+                        if state.val_range.end == last_written_val + 1 {
+                            break;
                         }
                     });
 
                     // check reversed scan
-                    scope.spawn(move |_| {
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
-                        loop {
-                            let guard = crossbeam_epoch::pin();
-                            let last_written_val = state.last_written_value.load(Ordering::Acquire);
-                            let scanned: Vec<i64> = tree
-                                .range(state.val_range.clone(), &guard)
-                                .rev()
-                                .map(|(_, v)| *v)
-                                .collect();
-                            let expected: Vec<i64> =
-                                (state.val_range.start..=last_written_val).rev().collect();
-                            assert!(
-                                scanned.ends_with(&expected),
-                                "Reversed= scanned: {:?}, expected: {:?}; Range: {:?}---{:?}",
-                                scanned,
-                                expected,
-                                state.val_range,
-                                (state.val_range.start..=last_written_val)
-                            );
+                    scope.spawn(move |_| loop {
+                        let guard = crossbeam_epoch::pin();
+                        let last_written_val = state.last_written_value.load(Ordering::Acquire);
+                        let scanned: Vec<i64> = tree
+                            .range(state.val_range.clone(), &guard)
+                            .rev()
+                            .map(|(_, v)| *v)
+                            .collect();
+                        let expected: Vec<i64> =
+                            (state.val_range.start..=last_written_val).rev().collect();
+                        assert!(
+                            scanned.ends_with(&expected),
+                            "Reversed= scanned: {:?}, expected: {:?}; Range: {:?}---{:?}",
+                            scanned,
+                            expected,
+                            state.val_range,
+                            (state.val_range.start..=last_written_val)
+                        );
 
-                            if state.val_range.end == last_written_val + 1 {
-                                break;
-                            }
+                        if state.val_range.end == last_written_val + 1 {
+                            break;
                         }
                     });
 
                     // check iter()
-                    scope.spawn(move |_| {
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
-                        loop {
-                            let guard = crossbeam_epoch::pin();
-                            let last_written_val = state.last_written_value.load(Ordering::Acquire);
+                    scope.spawn(move |_| loop {
+                        let guard = crossbeam_epoch::pin();
+                        let last_written_val = state.last_written_value.load(Ordering::Acquire);
 
-                            let scanned: Vec<i64> = tree
-                                .iter(&guard)
-                                .filter_map(|(_, v)| {
-                                    if state.val_range.contains(v) {
-                                        Some(*v)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            let expected: Vec<i64> =
-                                (state.val_range.start..=last_written_val).collect();
-                            assert!(
-                                scanned.starts_with(&expected),
-                                "scanned: {:?}, expected: {:?}",
-                                scanned,
-                                expected,
-                            );
+                        let scanned: Vec<i64> = tree
+                            .iter(&guard)
+                            .filter_map(|(_, v)| {
+                                if state.val_range.contains(v) {
+                                    Some(*v)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let expected: Vec<i64> =
+                            (state.val_range.start..=last_written_val).collect();
+                        assert!(
+                            scanned.starts_with(&expected),
+                            "scanned: {:?}, expected: {:?}",
+                            scanned,
+                            expected,
+                        );
 
-                            if state.val_range.end == last_written_val + 1 {
-                                break;
-                            }
+                        if state.val_range.end == last_written_val + 1 {
+                            break;
                         }
                     });
                 }
@@ -465,7 +440,6 @@ fn scan_with_deletes() {
                     last_removed_value: AtomicUsize::new(thread_id * changes + changes),
                     val_range: ((thread_id * changes)..(thread_id * changes + changes)),
                 };
-                let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                 for i in state.val_range.clone() {
                     let guard = crossbeam_epoch::pin();
                     tree.insert(i, i, &guard);
@@ -473,14 +447,13 @@ fn scan_with_deletes() {
                 thread_checkpoint.insert(thread_id, state);
             }
 
-            crossbeam_utils::thread::scope(|scope| {
+            thread::scope(|scope| {
                 // spawn same count of 'monitoring' threads which
                 // check that all values deleted not visible to scanner thread
                 for thread_id in 0..threads {
                     let state = thread_checkpoint.get(&thread_id).unwrap();
 
                     scope.spawn(move |_| {
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         for i in state.val_range.clone().rev() {
                             let guard = crossbeam_epoch::pin();
                             tree.delete(&i, &guard).unwrap();
@@ -489,42 +462,36 @@ fn scan_with_deletes() {
                     });
 
                     // check forward scan
-                    scope.spawn(move |_| {
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
-                        loop {
-                            let guard = crossbeam_epoch::pin();
-                            let last_removed_val = state.last_removed_value.load(Ordering::Acquire);
-                            assert!(tree
-                                .range(state.val_range.clone(), &guard)
-                                .filter(|(_, v)| {
-                                    (last_removed_val..state.val_range.end).contains(&v)
-                                })
-                                .next()
-                                .is_none());
+                    scope.spawn(move |_| loop {
+                        let guard = crossbeam_epoch::pin();
+                        let last_removed_val = state.last_removed_value.load(Ordering::Acquire);
+                        assert!(tree
+                            .range(state.val_range.clone(), &guard)
+                            .filter(|(_, v)| {
+                                (last_removed_val..state.val_range.end).contains(&v)
+                            })
+                            .next()
+                            .is_none());
 
-                            if state.val_range.start == last_removed_val {
-                                break;
-                            }
+                        if state.val_range.start == last_removed_val {
+                            break;
                         }
                     });
 
                     // check iter()
-                    scope.spawn(move |_| {
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
-                        loop {
-                            let guard = crossbeam_epoch::pin();
-                            let last_removed_val = state.last_removed_value.load(Ordering::Acquire);
-                            assert!(tree
-                                .iter(&guard)
-                                .filter(|(_, v)| {
-                                    (last_removed_val..state.val_range.end).contains(&v)
-                                })
-                                .next()
-                                .is_none());
+                    scope.spawn(move |_| loop {
+                        let guard = crossbeam_epoch::pin();
+                        let last_removed_val = state.last_removed_value.load(Ordering::Acquire);
+                        assert!(tree
+                            .iter(&guard)
+                            .filter(|(_, v)| {
+                                (last_removed_val..state.val_range.end).contains(&v)
+                            })
+                            .next()
+                            .is_none());
 
-                            if state.val_range.start == last_removed_val {
-                                break;
-                            }
+                        if state.val_range.start == last_removed_val {
+                            break;
                         }
                     });
                 }
@@ -540,16 +507,14 @@ fn compute_with_value_update() {
         |size| BzTree::<usize, usize>::with_node_size(size as u16),
         |tree, threads, iters| {
             for i in 0..threads * 3 {
-                let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                 assert!(tree.insert(i, 0, &crossbeam_epoch::pin()));
             }
 
-            let history = crossbeam_utils::thread::scope(|scope| {
+            let history = thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for _ in 0..threads {
                     handles.push(scope.spawn(|_| {
                         let mut ops = Ops::new();
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         for _ in 0..iters {
                             let key = thread_rng().gen_range(0..threads * 3);
                             assert!(
@@ -576,7 +541,6 @@ fn compute_with_value_update() {
             })
             .unwrap();
 
-            let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
             let guard = crossbeam_epoch::pin();
             history.run_check(|key| tree.get(key, &guard));
         },
@@ -588,12 +552,11 @@ fn compute_with_value_delete() {
     test(
         |size| BzTree::<usize, usize>::with_node_size(size as u16),
         |tree, threads, iters| {
-            let history = crossbeam_utils::thread::scope(|scope| {
+            let history = thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for _ in 0..threads {
                     handles.push(scope.spawn(|_| {
                         let mut ops = Ops::new();
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         for _ in 0..iters {
                             let key = thread_rng().gen_range(0..threads * 3);
                             if thread_rng().gen_bool(0.5) {
@@ -631,7 +594,6 @@ fn compute_with_value_delete() {
             })
             .unwrap();
 
-            let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
             let guard = crossbeam_epoch::pin();
             history.run_check(|key| tree.get(key, &guard));
         },
@@ -642,12 +604,11 @@ fn liveness() {
     test(
         |size| BzTree::<String, usize>::with_node_size(size as u16),
         |tree, threads, shard_size: usize| {
-            crossbeam_utils::thread::scope(|scope| {
+            thread::scope(|scope| {
                 for id in 0..threads {
                     scope.spawn(move |_| {
                         let thread_id = id;
                         let base = shard_size * thread_id;
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         let mut keys: Vec<usize> = (base..base + shard_size).collect();
                         keys.shuffle(&mut thread_rng());
                         for i in keys {
@@ -665,7 +626,6 @@ fn liveness() {
                     scope.spawn(move |_| {
                         let thread_id = id;
                         let base = shard_size * thread_id;
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         let mut keys: Vec<usize> = (base..base + shard_size).collect();
                         keys.shuffle(&mut thread_rng());
                         for i in keys {
@@ -678,7 +638,6 @@ fn liveness() {
                     scope.spawn(move |_| {
                         let thread_id = id;
                         let base = shard_size * thread_id;
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         let mut keys: Vec<usize> = (base..base + shard_size).collect();
                         keys.shuffle(&mut thread_rng());
                         for i in keys {
@@ -691,7 +650,6 @@ fn liveness() {
                     scope.spawn(move |_| {
                         let thread_id = id;
                         let base = shard_size * thread_id;
-                        let tree = unsafe { &mut *(tree.load(Ordering::Relaxed)) };
                         let keys: Vec<usize> = (base..base + shard_size).collect();
                         for _ in 0..keys.len() {
                             let guard = crossbeam_epoch::pin();

@@ -19,7 +19,7 @@ where
     K: Clone + Ord + Hash + Debug,
     V: Send + Sync + Clone + Ord + Debug,
 {
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     for (key, val) in &elements {
         let guard = crossbeam_epoch::pin();
         if use_upsert {
@@ -41,7 +41,7 @@ where
     drop(tree);
 }
 
-fn fill(tree: &mut BzTree<Key<usize>, String>, size: usize) -> Vec<(Key<usize>, String)> {
+fn fill(tree: &BzTree<Key<usize>, String>, size: usize) -> Vec<(Key<usize>, String)> {
     let mut expected_items: Vec<(Key<usize>, String)> = Vec::new();
     for key in 0..size {
         let key = Key::new(key);
@@ -138,7 +138,7 @@ fn upsert_same_element() {
     let levels = 3;
     let tree_size = node_size.pow(levels);
     let tree_items: Vec<usize> = std::iter::repeat(1).take(tree_size).collect();
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     for i in &tree_items {
         let guard = crossbeam_epoch::pin();
         tree.upsert(*i, *i, &guard);
@@ -155,7 +155,7 @@ fn combined_inserts_and_upserts() {
     let node_size: usize = thread_rng().gen_range(50..100);
     println!("Node size: {:?}", node_size);
     let mut expected: Vec<(Key<usize>, String)> = Vec::with_capacity(node_size);
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     let tree_levels = 3;
 
     for i in 0..node_size.pow(tree_levels) {
@@ -180,9 +180,9 @@ fn deletes_starting_from_tree_start() {
     let tree_levels = 3;
     let size = node_size.pow(tree_levels);
     println!("Node size: {:?}", node_size);
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     for _ in 0..2 {
-        let expected_items = fill(&mut tree, size);
+        let expected_items = fill(&tree, size);
         for (key, value) in &expected_items {
             let guard = &crossbeam_epoch::pin();
             let key: &usize = key.borrow();
@@ -224,10 +224,10 @@ fn deletes_starting_from_tree_end() {
 fn deletes_at_random_positions() {
     let node_size: usize = thread_rng().gen_range(2..100);
     println!("Node size: {:?}", node_size);
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     let size = node_size.pow(3);
     for _ in 0..2 {
-        let mut expected_items = fill(&mut tree, size);
+        let mut expected_items = fill(&tree, size);
         expected_items.shuffle(&mut thread_rng());
         for (key, value) in &expected_items {
             let key: &usize = key.borrow();
@@ -247,7 +247,7 @@ fn deletes_at_random_positions() {
 fn range() {
     let node_size: usize = thread_rng().gen_range(2..30);
     println!("Node size: {:?}", node_size);
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     let tree_levels = 3;
 
     let mut expected_keys: Vec<Key<usize>> = Vec::new();
@@ -329,7 +329,7 @@ fn range() {
 fn iter() {
     let node_size: usize = thread_rng().gen_range(2..30);
     println!("Node size: {:?}", node_size);
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     let tree_levels = 3;
 
     let mut expected_keys: Vec<usize> = Vec::new();
@@ -379,7 +379,7 @@ fn iter() {
 fn mixed_scan() {
     let node_size: usize = thread_rng().gen_range(2..100);
     println!("Node size: {:?}", node_size);
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     let mut expected_keys = Vec::new();
     let mut keys: Vec<usize> = (0..node_size.pow(3)).collect();
     keys.shuffle(&mut thread_rng());
@@ -417,7 +417,7 @@ fn mixed_scan() {
 fn all_operations_combinations() {
     let size = 1000;
     let mut last_state = Ops::new();
-    let mut tree: BzTree<Key<u64>, String> = BzTree::with_node_size(size);
+    let tree: BzTree<Key<u64>, String> = BzTree::with_node_size(size);
     let mut greatest_key = Key::new(0);
     for _ in 0..=size {
         // try to create same keys to check upserts
@@ -455,7 +455,7 @@ fn all_operations_combinations() {
 fn conditional_op_combinations() {
     let size = 1000;
     let mut last_state = Ops::new();
-    let mut tree: BzTree<Key<u64>, u64> = BzTree::with_node_size(size);
+    let tree: BzTree<Key<u64>, u64> = BzTree::with_node_size(size);
     for i in 0..=size {
         let key = Key::new(i as u64);
         let value = thread_rng().gen::<u64>();
@@ -509,7 +509,7 @@ fn conditional_op_combinations() {
 fn check_kv_drop() {
     let ref_cnt = AtomicUsize::new(0);
 
-    let mut tree: BzTree<String, Droppable> = BzTree::with_node_size(70);
+    let tree: BzTree<String, Droppable> = BzTree::with_node_size(70);
     let mut vec: Vec<usize> = (0..2000).collect();
     vec.shuffle(&mut thread_rng());
     let guard = unsafe { crossbeam_epoch::unprotected() };

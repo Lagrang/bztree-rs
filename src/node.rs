@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::mem::MaybeUninit;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::option::Option::Some;
 use std::{mem, ptr};
 
@@ -15,6 +15,7 @@ pub struct Node<K: Ord, V> {
     status_word: HeapPointer<StatusWord>,
     sorted_len: usize,
     data_block: Vec<Entry<K, V>>,
+    readonly: bool,
 }
 
 impl<K: Ord, V> Node<K, V> {
@@ -26,7 +27,7 @@ impl<K: Ord, V> Node<K, V> {
         Self::init_with_capacity(Vec::new(), max_elements)
     }
 
-    pub fn from(mut sorted_elements: Vec<(K, V)>) -> Self
+    pub fn new_readonly(mut sorted_elements: Vec<(K, V)>) -> Self
     where
         K: Clone + Ord,
         V: Clone + Send + Sync,
@@ -53,6 +54,7 @@ impl<K: Ord, V> Node<K, V> {
             data_block: kv_block,
             status_word: HeapPointer::new(StatusWord::with_records(capacity as u16)),
             sorted_len: capacity,
+            readonly: true,
         }
     }
 
@@ -88,6 +90,7 @@ impl<K: Ord, V> Node<K, V> {
             data_block: kv_block,
             status_word: HeapPointer::new(StatusWord::with_records(sorted_len as u16)),
             sorted_len,
+            readonly: false,
         }
     }
 
@@ -101,6 +104,7 @@ impl<K: Ord, V> Node<K, V> {
         K: Ord,
         V: Send + Sync,
     {
+        debug_assert!(!self.readonly);
         let node_ptr = self as *const Node<K, V>;
         let cur_status = unsafe { (&*node_ptr).status_word.read(guard) };
         match self.insert_phase_one(key, value, false, cur_status, guard) {
@@ -124,6 +128,7 @@ impl<K: Ord, V> Node<K, V> {
         K: Ord,
         V: Send + Sync,
     {
+        debug_assert!(!self.readonly);
         let node_ptr = self as *const Node<K, V>;
         let cur_status = unsafe { (&*node_ptr).status_word.read(guard) };
         match self.insert_phase_one(key, value, true, cur_status, guard) {
@@ -146,6 +151,7 @@ impl<K: Ord, V> Node<K, V> {
         K: Ord,
         V: Send + Sync,
     {
+        debug_assert!(!self.readonly);
         match self.insert_phase_one(key, value, true, cur_status, guard) {
             Ok(reserved_entry) => self.insert_phase_two(reserved_entry, true, guard),
             Err(e) => Err(e),
@@ -160,6 +166,7 @@ impl<K: Ord, V> Node<K, V> {
         K: Borrow<Q>,
         Q: Ord,
     {
+        debug_assert!(!self.readonly);
         let current_status = self.status_word.read(guard);
         if current_status.is_frozen() {
             return Err(DeleteError::Retry);
@@ -210,6 +217,7 @@ impl<K: Ord, V> Node<K, V> {
         K: Borrow<Q>,
         Q: Ord,
     {
+        debug_assert!(!self.readonly);
         if status_word.is_frozen() {
             return Err(DeleteError::Retry);
         }
@@ -267,6 +275,7 @@ impl<K: Ord, V> Node<K, V> {
         K: PartialOrd<Q>,
         V: Clone,
     {
+        debug_assert!(self.readonly);
         if self.sorted_len == 0 {
             return None;
         }
@@ -312,6 +321,7 @@ impl<K: Ord, V> Node<K, V> {
         K: PartialOrd<Q>,
         V: Clone,
     {
+        debug_assert!(self.readonly);
         if self.sorted_len == 0 {
             return None;
         }
@@ -354,6 +364,7 @@ impl<K: Ord, V> Node<K, V> {
         K: PartialOrd<Q>,
         V: Clone,
     {
+        debug_assert!(self.readonly);
         if self.sorted_len == 0 {
             return [None, None];
         }
@@ -567,8 +578,8 @@ impl<K: Ord, V> Node<K, V> {
             .map(|(k, v)| ((*k).clone(), (*v).clone()))
             .collect();
         let split_point = kvs.len() / 2;
-        let left = Self::from(kvs.drain(..split_point).collect());
-        let right = Self::from(kvs);
+        let left = Self::new_readonly(kvs.drain(..split_point).collect());
+        let right = Self::new_readonly(kvs);
 
         SplitMode::Split(left, right)
     }
@@ -643,8 +654,8 @@ impl<K: Ord, V> Node<K, V> {
             "Both nodes must be frozen before merge"
         );
 
-        let len = self.estimated_len();
-        let other_len = other.estimated_len();
+        let len = self.estimated_len(guard);
+        let other_len = other.estimated_len(guard);
         if len + other_len > merged_node_capacity {
             return MergeMode::MergeFailed;
         }
@@ -675,7 +686,7 @@ impl<K: Ord, V> Node<K, V> {
         }
         p2.for_each(|kv| sorted_kvs.push(kv));
 
-        MergeMode::NewNode(Self::from(sorted_kvs))
+        MergeMode::NewNode(Self::new_readonly(sorted_kvs))
     }
 
     #[inline(always)]
@@ -684,27 +695,25 @@ impl<K: Ord, V> Node<K, V> {
     }
 
     #[inline(always)]
-    pub fn remaining_capacity(&self) -> usize {
-        let guard = crossbeam_epoch::pin();
-        self.capacity() - self.status_word.read(&guard).reserved_records() as usize
+    pub fn remaining_capacity(&self, guard: &Guard) -> usize {
+        self.capacity() - self.status_word.read(guard).reserved_records() as usize
     }
 
     /// Estimated length of node. If no updates/deleted were applied to node,
     /// method return exact length(e.g. read only nodes should use this method
     /// to obtain exact length because it very cheap).
     #[inline(always)]
-    pub fn estimated_len(&self) -> usize {
-        let guard = crossbeam_epoch::pin();
-        let status_word: &StatusWord = self.status_word.read(&guard);
+    pub fn estimated_len(&self, guard: &Guard) -> usize {
+        let status_word: &StatusWord = self.status_word.read(guard);
         (status_word.reserved_records() - status_word.deleted_records()) as usize
     }
 
     #[inline(always)]
-    pub fn exact_len(&self) -> usize
+    pub fn exact_len(&self, guard: &Guard) -> usize
     where
         K: Ord,
     {
-        self.iter(&crossbeam_epoch::pin()).count()
+        self.iter(guard).count()
     }
 
     #[inline(always)]
@@ -812,7 +821,7 @@ impl<K: Ord, V> Node<K, V> {
             return Err(InsertError::NodeFrozen(value));
         }
 
-        if self.remaining_capacity() == 0 {
+        if self.remaining_capacity(guard) == 0 {
             return Err(InsertError::Split(value));
         }
 
@@ -900,14 +909,14 @@ impl<K: Ord, V> Node<K, V> {
             }
 
             let mut mwcas = MwCas::new();
+            // ensure that node is not frozen during MWCAS
+            // or status word changed by other insertion/deletion/split/merge.
+            mwcas.compare_exchange(&self.status_word, current_status, current_status.clone());
             mwcas.compare_exchange_u64(
                 &self.data_block[index].metadata,
                 reserved_metadata.into(),
                 Metadata::visible().into(),
             );
-            // ensure that node is not frozen during MWCAS
-            // or status word changed by other insertion/deletion/split/merge.
-            mwcas.compare_exchange(&self.status_word, current_status, current_status.clone());
 
             if mwcas.exec(guard) {
                 return if let Some(index) = new_entry.existing_entry {
@@ -952,7 +961,7 @@ impl<K: Ord, V> Node<K, V> {
                 key,
                 value,
                 index: next_entry_index,
-                existing_entry: None,
+                existing_entry: None, // will be filled by caller if needed
                 prev_status_word: current_status.clone(),
                 await_reserved_entries,
             })
@@ -1011,9 +1020,9 @@ where
         writeln!(
             f,
             "length: {}, total capacity/remains: {}/{}, status word: {}",
-            self.exact_len(),
+            self.exact_len(&guard),
             self.capacity(),
-            self.remaining_capacity(),
+            self.remaining_capacity(&guard),
             self.status_word.read(&guard)
         )
         .unwrap();
@@ -1027,7 +1036,6 @@ where
 
 struct Entry<K, V> {
     metadata: U64Pointer,
-    // TODO: add note to docs that tree can hold removed keys for some time
     key: MaybeUninit<K>,
     // Manually drop because value can be references by several nodes at time(during split/merge)
     value: MaybeUninit<V>,
@@ -1110,32 +1118,74 @@ where
         Q: Ord,
     {
         let mut kvs: Vec<u16> = Vec::with_capacity(status_word.reserved_records() as usize);
-        let mut scanned_keys = BTreeSet::new();
 
-        // use reversed iterator because unsorted part at end of KV block has most recent values
-        for i in (0..status_word.reserved_records() as usize).rev() {
-            let entry = &node.data_block[i];
-            let metadata = loop {
-                let metadata: Metadata = entry.metadata.read(guard).into();
-                if !metadata.is_reserved() {
-                    break metadata;
-                }
-                // someone try to add entry at same time, continue check same entry
-                // until reserved entry will become valid
-            };
+        if node.readonly || status_word.reserved_records() as usize == node.sorted_len {
+            if node.sorted_len > 0 {
+                let sorted_block = &node.data_block[0..node.sorted_len];
+                let start_idx = match key_range.start_bound() {
+                    Bound::Excluded(key) => sorted_block
+                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
+                        .map_or_else(|index| index, |index| index + 1),
+                    Bound::Included(key) => sorted_block
+                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
+                        .map_or_else(|index| index, |index| index),
+                    Bound::Unbounded => 0,
+                };
 
-            // if is first time when we see this key, we return it
-            // otherwise, most recent version(even deletion) of key
-            // already seen by scanner and older versions must be ignored.
-            if metadata.visible_or_deleted() {
-                let key = unsafe { node.data_block[i].key() };
-                if key_range.contains(key.borrow())
-                    && scanned_keys.insert(key)
-                    && metadata.is_visible()
-                {
-                    kvs.push(i as u16);
+                let end_idx = match key_range.end_bound() {
+                    Bound::Excluded(key) => sorted_block
+                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
+                        .map_or_else(|index| index, |index| index),
+                    Bound::Included(key) => sorted_block
+                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
+                        .map_or_else(|index| index, |index| index + 1),
+                    Bound::Unbounded => node.sorted_len,
+                };
+
+                if !node.readonly {
+                    (start_idx..end_idx).for_each(|i| {
+                        let metadata: Metadata = node.data_block[i].metadata.read(guard).into();
+                        if metadata.is_visible() {
+                            kvs.push(i as u16);
+                        }
+                    });
+                } else {
+                    (start_idx..end_idx).for_each(|i| kvs.push(i as u16));
                 }
             }
+        } else {
+            let mut scanned_keys = BTreeSet::new();
+            // use reversed iterator because unsorted part at end of KV block has most recent values
+            for i in (0..status_word.reserved_records() as usize).rev() {
+                let entry = &node.data_block[i];
+                let metadata = loop {
+                    let metadata: Metadata = entry.metadata.read(guard).into();
+                    if !metadata.is_reserved() {
+                        break metadata;
+                    }
+                    // someone try to add entry at same time, continue check same entry
+                    // until reserved entry will become valid
+                };
+
+                // if is first time when we see this key, we return it
+                // otherwise, most recent version(even deletion) of key
+                // already seen by scanner and older versions must be ignored.
+                if metadata.visible_or_deleted() {
+                    let key = unsafe { node.data_block[i].key() };
+                    if key_range.contains(key.borrow())
+                        && scanned_keys.insert(key)
+                        && metadata.is_visible()
+                    {
+                        kvs.push(i as u16);
+                    }
+                }
+            }
+
+            kvs.sort_by(|index1, index2| {
+                let key1 = unsafe { node.data_block[*index1 as usize].key() };
+                let key2 = unsafe { node.data_block[*index2 as usize].key() };
+                key1.cmp(key2)
+            });
         }
 
         if kvs.is_empty() {
@@ -1147,12 +1197,6 @@ where
                 node,
             };
         }
-
-        kvs.sort_by(|index1, index2| {
-            let key1 = unsafe { node.data_block[*index1 as usize].key() };
-            let key2 = unsafe { node.data_block[*index2 as usize].key() };
-            key1.cmp(key2)
-        });
 
         Scanner {
             fwd_idx: 0,
@@ -1560,7 +1604,7 @@ mod tests {
                     panic!("Node must compacted, not split");
                 }
                 SplitMode::Compact(compacted) => {
-                    assert_eq!(compacted.exact_len(), elements as usize)
+                    assert_eq!(compacted.exact_len(&guard), elements as usize)
                 }
             }
         }
@@ -1595,12 +1639,12 @@ mod tests {
                 thread_rng().gen_range(0..expected_elems.len())
             };
             let (vec1, vec2) = expected_elems.split_at(split_point);
-            let node1 = Node::from(
+            let node1 = Node::new_readonly(
                 vec1.iter()
                     .map(|(k, v)| ((*k).clone(), (*v).clone()))
                     .collect(),
             );
-            let node2 = Node::from(
+            let node2 = Node::new_readonly(
                 vec2.iter()
                     .map(|(k, v)| ((*k).clone(), (*v).clone()))
                     .collect(),
@@ -1612,7 +1656,7 @@ mod tests {
 
             let merged_node = if let MergeMode::NewNode(node) = node1.merge_with_leaf(
                 &node2,
-                node1.estimated_len() + node2.estimated_len(),
+                node1.estimated_len(&guard) + node2.estimated_len(&guard),
                 &guard,
             ) {
                 node
@@ -1620,7 +1664,7 @@ mod tests {
                 panic!("Unexpected merge mode");
             };
             let res_vec: Vec<(&u32, &u32)> = merged_node.iter(&guard).collect();
-            assert_eq!(merged_node.exact_len(), res_vec.len());
+            assert_eq!(merged_node.exact_len(&guard), res_vec.len());
             assert_eq!(expected_elems.len(), res_vec.len());
             for i in 0..expected_elems.len() {
                 assert_eq!(expected_elems[i], res_vec[i]);
@@ -1642,14 +1686,15 @@ mod tests {
 
             vec.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
             let (vec1, vec2) = vec.split_at(vec.len() / 2);
-            let node1: Node<u32, u32> = Node::from(vec1.to_vec());
-            let node2 = Node::from(vec2.to_vec());
+            let node1: Node<u32, u32> = Node::new_readonly(vec1.to_vec());
+            let node2 = Node::new_readonly(vec2.to_vec());
 
             let guard = crossbeam_epoch::pin();
             node1.try_froze(&guard);
             node2.try_froze(&guard);
 
-            let cap = thread_rng().gen_range(0..node1.estimated_len() + node2.estimated_len());
+            let cap = thread_rng()
+                .gen_range(0..node1.estimated_len(&guard) + node2.estimated_len(&guard));
             assert!(matches!(
                 node1.merge_with_leaf(&node2, cap, &guard),
                 MergeMode::MergeFailed
@@ -1927,7 +1972,7 @@ mod tests {
     fn iter_on_empty_unsorted_space() {
         let guard = crossbeam_epoch::pin();
         let expected: Vec<(u32, u32)> = vec![(1, 0), (3, 3), (4, 4), (5, 5)];
-        let node: Node<u32, u32> = Node::from(expected.clone());
+        let node: Node<u32, u32> = Node::new_readonly(expected.clone());
 
         let mut count = 0;
         for (i, (k, v)) in node.iter(&guard).enumerate() {

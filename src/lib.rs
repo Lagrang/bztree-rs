@@ -125,10 +125,11 @@ where
     /// # Return
     /// Returns true if key-value pair successfully inserted, otherwise false if key already in
     /// tree.
-    pub fn insert(&mut self, key: K, value: V, guard: &Guard) -> bool {
+    pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
+        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         let mut value: V = value;
         loop {
-            let node = self.find_leaf_mut(&key, guard);
+            let node = self_mut.find_leaf_mut(&key, guard);
             match node.insert(key.clone(), value, guard) {
                 Ok(_) => {
                     return true;
@@ -158,12 +159,13 @@ where
     /// Insert key-value pair if not already exists, otherwise replace value of existing element.
     /// # Return
     /// Returns value previously associated with same key or `None`.
-    pub fn upsert<'g>(&'g mut self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
+    pub fn upsert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
+        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         let mut value: V = value;
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = self.find_leaf_ptr(&key, &guard);
+            let node = self_mut.find_leaf_ptr(&key, &guard);
             match unsafe { (*node).upsert(key.clone(), value, guard) } {
                 Ok(prev_val) => {
                     return prev_val;
@@ -192,16 +194,17 @@ where
     /// Delete value associated with key.
     /// # Return
     /// Returns removed value if key found in tree.
-    pub fn delete<'g, Q>(&'g mut self, key: &Q, guard: &'g Guard) -> Option<&'g V>
+    pub fn delete<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
+        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = self.find_leaf_ptr(key, guard);
-            let len = unsafe { (*node).estimated_len() };
+            let node = self_mut.find_leaf_ptr(key, guard);
+            let len = unsafe { (*node).estimated_len(guard) };
             match unsafe { (*node).delete(key.borrow(), guard) } {
                 Ok(val) => {
                     if self.should_merge(len - 1) {
@@ -261,32 +264,32 @@ where
     }
 
     /// Remove and return first element of tree according to key ordering.
-    pub fn pop_first<'g>(&'g mut self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        let self_ptr = self as *mut BzTree<K, V>;
+    pub fn pop_first<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
+        let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
         loop {
-            let key = if let Some((key, _)) = (unsafe { &*self_ptr }).iter(guard).next() {
+            let key = if let Some((key, _)) = (unsafe { &*self_mut }).iter(guard).next() {
                 key.clone()
             } else {
                 return None;
             };
 
-            if let Some(val) = (unsafe { &mut *self_ptr }).delete(&key, guard) {
+            if let Some(val) = (unsafe { &mut *self_mut }).delete(&key, guard) {
                 return Some((key, val));
             }
         }
     }
 
     /// Remove and return last element of tree according to key ordering.
-    pub fn pop_last<'g>(&'g mut self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        let self_ptr = self as *mut BzTree<K, V>;
+    pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
+        let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
         loop {
-            let key = if let Some((key, _)) = (unsafe { &*self_ptr }).iter(guard).rev().next() {
+            let key = if let Some((key, _)) = (unsafe { &*self_mut }).iter(guard).rev().next() {
                 key.clone()
             } else {
                 return None;
             };
 
-            if let Some(val) = (unsafe { &mut *self_ptr }).delete(&key, guard) {
+            if let Some(val) = (unsafe { &mut *self_mut }).delete(&key, guard) {
                 return Some((key, val));
             }
         }
@@ -302,14 +305,15 @@ where
     /// Because of this behaviour, function code should not modify global application state or
     /// such code should be carefully designed(understanding consequences of repeated function
     /// calls for same key).    
-    pub fn compute<Q, F>(&mut self, key: &Q, mut new_val: F, guard: &Guard) -> bool
+    pub fn compute<'g, Q, F>(&'g self, key: &Q, mut new_val: F, guard: &'g Guard) -> bool
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
         F: FnMut((&K, &V)) -> Option<V>,
     {
+        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         loop {
-            let node = self.find_leaf_ptr(key, guard);
+            let node = self_mut.find_leaf_ptr(key, guard);
             if let Some((found_key, val, status_word, value_index)) =
                 unsafe { (*node).get(key, guard) }
             {
@@ -336,7 +340,7 @@ where
                         Err(InsertError::Retry(_)) | Err(InsertError::NodeFrozen(_)) => {}
                     };
                 } else {
-                    let len = unsafe { (*node).estimated_len() };
+                    let len = unsafe { (*node).estimated_len(guard) };
                     match unsafe { (*node).conditional_delete(status_word, value_index, guard) } {
                         Ok(_) => {
                             if self.should_merge(len - 1) {
@@ -358,7 +362,7 @@ where
         node_size <= self.node_size / 3
     }
 
-    fn merge_recursive<Q>(&mut self, key: &Q, guard: &Guard)
+    fn merge_recursive<Q>(&self, key: &Q, guard: &Guard)
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
@@ -404,7 +408,7 @@ where
         match path.node_pointer {
             NodePointer::Leaf(node) => {
                 // between merge retries, node can receive new KVs and stopped being underutilized
-                if !self.should_merge(node.estimated_len()) {
+                if !self.should_merge(node.estimated_len(guard)) {
                     Self::unfroze(unfroze_on_fail);
                     return MergeResult::Completed;
                 }
@@ -428,8 +432,8 @@ where
 
         // if node became empty and parent has no links to other nodes and this is not a special
         // +Inf node, we should remove parent from grandparent.
-        if parent.node().estimated_len() <= 1
-            && path.node_pointer.len() == 0
+        if parent.node().estimated_len(guard) <= 1
+            && path.node_pointer.len(guard) == 0
             && parent.child_key != Key::pos_infinite()
         {
             return self.remove_empty_parent(&path, &parent, unfroze_on_fail, guard);
@@ -439,7 +443,7 @@ where
             // merge with sibling will return new parent node. This new parent doesn't contain
             // underutilized node. This new parent node should be installed in grandparent node
             // by replacing current parent node pointer with pointer to new parent node.
-            if parent.node().estimated_len() <= 1 {
+            if parent.node().estimated_len(guard) <= 1 {
                 // no siblings in parent node, try to merge parent with sibling on it's level.
                 Self::unfroze(unfroze_on_fail);
                 return MergeResult::RecursiveMerge(TraversePath {
@@ -458,7 +462,7 @@ where
             }
         };
 
-        let merge_new_parent = self.should_merge(new_parent.estimated_len());
+        let merge_new_parent = self.should_merge(new_parent.estimated_len(guard));
 
         let mut mwcas = MwCas::new();
         // if parent node has grandparent node, then check that grandparent not frozen.
@@ -527,7 +531,7 @@ where
             }
             unfroze_on_fail.push(gparent.node_pointer.clone());
 
-            let new_node = InterimNode::from(
+            let new_node = InterimNode::new_readonly(
                 gparent_node
                     .iter(guard)
                     .filter_map(|(k, v)| {
@@ -576,7 +580,7 @@ where
             if let NodePointer::Interim(root) = cur_root {
                 let root_status = root.status_word().read(guard);
                 // if root contains only 1 node, move this node up to root level
-                if !root_status.is_frozen() && root.estimated_len() == 1 {
+                if !root_status.is_frozen() && root.estimated_len(guard) == 1 {
                     let (_, child_ptr) = root.iter(guard).next().unwrap();
                     let child_node_pointer = child_ptr.read(guard);
                     let child_status = child_node_pointer.status_word().read(guard);
@@ -650,7 +654,7 @@ where
                     NodePointer::Interim(other) => {
                         match node.merge_with_interim(
                             other,
-                            node.estimated_len() + other.estimated_len(),
+                            node.estimated_len(guard) + other.estimated_len(guard),
                             guard,
                         ) {
                             MergeMode::NewNode(merged_node) => {
@@ -679,7 +683,7 @@ where
         // merge completed or compacted(some empty siblings removed):
         // create new parent node with merged node and without empty/merged siblings.
         let mut buffer = Vec::with_capacity(
-            parent.node().estimated_len()
+            parent.node().estimated_len(guard)
                 - merged_siblings.len()
                 - merged.as_ref().map_or_else(|| 0, |_| 1),
         );
@@ -698,7 +702,7 @@ where
                 buffer.push((key.clone(), HeapPointer::new(val.read(guard).clone())));
             }
         }
-        Ok(InterimNode::from(buffer))
+        Ok(InterimNode::new_readonly(buffer))
     }
 
     #[inline(always)]
@@ -814,7 +818,7 @@ where
                             .0
                             .clone();
                         debug_assert!(
-                            right.exact_len() > 0,
+                            right.exact_len(guard) > 0,
                             "Right node must have at least 1 element after split"
                         );
                         // keys between (..left_key] in left
@@ -829,7 +833,7 @@ where
                                 HeapPointer::new(NodePointer::new_leaf(right)),
                             ),
                         ];
-                        NodePointer::new_interim(InterimNode::from(sorted_elements))
+                        NodePointer::new_interim(InterimNode::new_readonly(sorted_elements))
                     }
                     SplitMode::Compact(compacted_root) => NodePointer::new_leaf(compacted_root),
                 }
@@ -853,7 +857,7 @@ where
                             (left_key, HeapPointer::new(NodePointer::new_interim(left))),
                             (right_key, HeapPointer::new(NodePointer::new_interim(right))),
                         ];
-                        NodePointer::new_interim(InterimNode::from(sorted_elements))
+                        NodePointer::new_interim(InterimNode::new_readonly(sorted_elements))
                     }
                     SplitMode::Compact(compacted_root) => NodePointer::new_interim(compacted_root),
                 }
@@ -887,7 +891,7 @@ where
         where
             K: Clone + Ord,
         {
-            let node_len = parent_node.estimated_len();
+            let node_len = parent_node.estimated_len(guard);
             if node_len == max_node_size {
                 // parent node overflow, should be split
                 return None;
@@ -907,7 +911,7 @@ where
                 }
             }
 
-            Some(InterimNode::from(sorted_elems))
+            Some(InterimNode::new_readonly(sorted_elems))
         }
 
         match node {
@@ -1270,13 +1274,13 @@ impl<K: Ord, V> NodePointer<K, V> {
     }
 
     #[inline]
-    fn len(&self) -> usize
+    fn len(&self, guard: &Guard) -> usize
     where
         K: Ord,
     {
         match self {
-            NodePointer::Leaf(node) => node.exact_len(),
-            NodePointer::Interim(node) => node.estimated_len(),
+            NodePointer::Leaf(node) => node.exact_len(guard),
+            NodePointer::Interim(node) => node.estimated_len(guard),
         }
     }
 
@@ -1396,7 +1400,7 @@ mod tests {
 
     #[test]
     fn insert() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         tree.insert(Key::new("1"), "1", &crossbeam_epoch::pin());
         tree.insert(Key::new("2"), "2", &crossbeam_epoch::pin());
         tree.insert(Key::new("3"), "3", &crossbeam_epoch::pin());
@@ -1409,7 +1413,7 @@ mod tests {
 
     #[test]
     fn upsert() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         tree.upsert(Key::new("1"), "1", &crossbeam_epoch::pin());
         tree.upsert(Key::new("2"), "2", &crossbeam_epoch::pin());
         tree.upsert(Key::new("3"), "3", &crossbeam_epoch::pin());
@@ -1422,7 +1426,7 @@ mod tests {
 
     #[test]
     fn delete() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         tree.insert(Key::new("1"), "1", &crossbeam_epoch::pin());
         tree.insert(Key::new("2"), "2", &crossbeam_epoch::pin());
         tree.insert(Key::new("3"), "3", &crossbeam_epoch::pin());
@@ -1441,7 +1445,7 @@ mod tests {
 
     #[test]
     fn forward_scan() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         tree.insert(Key::new("1"), String::from("1"), &crossbeam_epoch::pin());
         tree.insert(Key::new("2"), String::from("2"), &crossbeam_epoch::pin());
         tree.insert(Key::new("3"), String::from("3"), &crossbeam_epoch::pin());
@@ -1502,7 +1506,7 @@ mod tests {
 
     #[test]
     fn reversed_scan() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         tree.insert(Key::new("1"), String::from("1"), &crossbeam_epoch::pin());
         tree.insert(Key::new("2"), String::from("2"), &crossbeam_epoch::pin());
         tree.insert(Key::new("3"), String::from("3"), &crossbeam_epoch::pin());
@@ -1549,7 +1553,7 @@ mod tests {
 
     #[test]
     fn reversed_scan_with_deletes() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         tree.insert(Key::new("1"), String::from("1"), &crossbeam_epoch::pin());
         tree.insert(Key::new("2"), String::from("2"), &crossbeam_epoch::pin());
         tree.insert(Key::new("3"), String::from("3"), &crossbeam_epoch::pin());
@@ -1595,7 +1599,7 @@ mod tests {
 
     #[test]
     fn mixed_scan() {
-        let mut tree = BzTree::with_node_size(3);
+        let tree = BzTree::with_node_size(3);
         tree.insert(
             Key::new(String::from("1")),
             String::from("1"),
@@ -1636,7 +1640,7 @@ mod tests {
     fn mixed_scan_on_root_node() {
         // size of tree node is greater than count of elements,
         // e.g. all elements placed in leaf root node
-        let mut tree = BzTree::with_node_size(30);
+        let tree = BzTree::with_node_size(30);
         tree.insert(
             Key::new(String::from("1")),
             String::from("1"),
@@ -1675,7 +1679,7 @@ mod tests {
 
     #[test]
     fn scan_after_delete() {
-        let mut tree = BzTree::with_node_size(3);
+        let tree = BzTree::with_node_size(3);
         tree.insert(Key::new(1), String::from("1"), &crossbeam_epoch::pin());
         tree.insert(Key::new(2), String::from("2"), &crossbeam_epoch::pin());
         tree.insert(Key::new(3), String::from("3"), &crossbeam_epoch::pin());
@@ -1721,8 +1725,38 @@ mod tests {
     }
 
     #[test]
+    fn scan_outside_of_existing_key_range() {
+        let tree = BzTree::with_node_size(2);
+        let guard = crossbeam_epoch::pin();
+        tree.insert(Key::new(2), String::from("2"), &guard);
+        tree.insert(Key::new(3), String::from("3"), &guard);
+        tree.insert(Key::new(4), String::from("4"), &guard);
+        tree.insert(Key::new(5), String::from("5"), &guard);
+        tree.insert(Key::new(6), String::from("6"), &guard);
+        tree.insert(Key::new(7), String::from("7"), &guard);
+        tree.insert(Key::new(8), String::from("8"), &guard);
+        tree.insert(Key::new(9), String::from("9"), &guard);
+        tree.insert(Key::new(10), String::from("10"), &guard);
+        tree.insert(Key::new(11), String::from("11"), &guard);
+        tree.insert(Key::new(12), String::from("12"), &guard);
+        tree.insert(Key::new(13), String::from("13"), &guard);
+
+        assert_eq!(tree.range(Key::new(0)..Key::new(1), &guard).count(), 0);
+        assert_eq!(tree.range(Key::new(0)..=Key::new(1), &guard).count(), 0);
+        assert_eq!(tree.range(Key::new(0)..Key::new(2), &guard).count(), 0);
+        assert_eq!(tree.range(..Key::new(2), &guard).count(), 0);
+        assert_eq!(tree.range(Key::new(14).., &guard).count(), 0);
+        assert_eq!(tree.range(Key::new(14)..Key::new(16), &guard).count(), 0);
+        assert_eq!(tree.range(Key::new(14)..=Key::new(16), &guard).count(), 0);
+
+        assert_eq!(tree.range(Key::new(5)..Key::new(5), &guard).count(), 0);
+        assert_eq!(tree.range(Key::new(6)..Key::new(2), &guard).count(), 0);
+        assert_eq!(tree.range(Key::new(14)..Key::new(10), &guard).count(), 0);
+    }
+
+    #[test]
     fn test_iter() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         tree.insert(Key::new(1), String::from("1"), &crossbeam_epoch::pin());
         tree.insert(Key::new(2), String::from("2"), &crossbeam_epoch::pin());
         tree.insert(Key::new(3), String::from("3"), &crossbeam_epoch::pin());
@@ -1739,7 +1773,7 @@ mod tests {
     fn test_iter_on_root_node() {
         // size of tree node is greater than count of elements,
         // e.g. all elements placed in leaf root node
-        let mut tree = BzTree::with_node_size(20);
+        let tree = BzTree::with_node_size(20);
         tree.insert(Key::new(1), String::from("1"), &crossbeam_epoch::pin());
         tree.insert(Key::new(2), String::from("2"), &crossbeam_epoch::pin());
         tree.insert(Key::new(3), String::from("3"), &crossbeam_epoch::pin());
@@ -1756,7 +1790,7 @@ mod tests {
     fn test_rev_iter_on_root_node() {
         // size of tree node is greater than count of elements,
         // e.g. all elements placed in leaf root node
-        let mut tree = BzTree::with_node_size(20);
+        let tree = BzTree::with_node_size(20);
         tree.insert(Key::new(1), String::from("1"), &crossbeam_epoch::pin());
         tree.insert(Key::new(2), String::from("2"), &crossbeam_epoch::pin());
         tree.insert(Key::new(3), String::from("3"), &crossbeam_epoch::pin());
@@ -1772,7 +1806,7 @@ mod tests {
 
     #[test]
     fn first() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         let guard = crossbeam_epoch::pin();
         tree.insert(Key::new("1"), "1", &guard);
         tree.insert(Key::new("2"), "2", &guard);
@@ -1793,7 +1827,7 @@ mod tests {
 
     #[test]
     fn last() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         let guard = crossbeam_epoch::pin();
         tree.insert(Key::new("1"), "1", &guard);
         tree.insert(Key::new("2"), "2", &guard);
@@ -1814,7 +1848,7 @@ mod tests {
 
     #[test]
     fn pop_first() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         let guard = crossbeam_epoch::pin();
         let count = 55;
         for i in 0..count {
@@ -1830,7 +1864,7 @@ mod tests {
 
     #[test]
     fn pop_last() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         let guard = crossbeam_epoch::pin();
         let count = 55;
         for i in 0..count {
@@ -1846,7 +1880,7 @@ mod tests {
 
     #[test]
     fn conditional_insert() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         let guard = crossbeam_epoch::pin();
         let count = 55;
         for i in 0..count {
@@ -1866,7 +1900,7 @@ mod tests {
 
     #[test]
     fn conditional_remove() {
-        let mut tree = BzTree::with_node_size(2);
+        let tree = BzTree::with_node_size(2);
         let guard = crossbeam_epoch::pin();
         let count = 55;
         for i in 0..count {
