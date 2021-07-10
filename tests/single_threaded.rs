@@ -14,6 +14,9 @@ use history_verifier::{History, Ops};
 
 mod history_verifier;
 
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 fn test_insertion<K, V>(mut elements: Vec<(K, V)>, node_size: usize, use_upsert: bool)
 where
     K: Clone + Ord + Hash + Debug,

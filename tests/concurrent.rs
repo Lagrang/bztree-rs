@@ -14,6 +14,9 @@ use std::hash::Hash;
 
 mod history_verifier;
 
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 fn test<F, TreeSupplier, K, V>(tree_creator: TreeSupplier, test: F)
 where
     F: Fn(&BzTree<K, V>, usize, usize),

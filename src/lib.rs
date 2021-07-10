@@ -5,7 +5,7 @@
 //! in-memory(not persistent) data structure.  
 //! BzTree uses [MwCAS](https://crates.io/crates/mwcas) crate to get access to multi-word CAS.
 //!
-//! /// # Usage
+//! # Examples
 //! ```
 //! use bztree::BzTree;
 //!
@@ -125,6 +125,17 @@ where
     /// # Return
     /// Returns true if key-value pair successfully inserted, otherwise false if key already in
     /// tree.
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// let key = "key".to_string();
+    /// assert!(tree.insert(key.clone(), 1, &guard));
+    /// assert!(!tree.insert(key.clone(), 5, &guard));
+    /// ```
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
         let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         let mut value: V = value;
@@ -159,6 +170,18 @@ where
     /// Insert key-value pair if not already exists, otherwise replace value of existing element.
     /// # Return
     /// Returns value previously associated with same key or `None`.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// let key = "key".to_string();
+    /// assert!(matches!(tree.upsert(key.clone(), 10, &guard), None));
+    /// assert!(matches!(tree.upsert(key.clone(), 11, &guard), Some(10)));
+    /// ```
     pub fn upsert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
         let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         let mut value: V = value;
@@ -194,6 +217,18 @@ where
     /// Delete value associated with key.
     /// # Return
     /// Returns removed value if key found in tree.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// let key = "key".to_string();
+    /// assert!(tree.insert(key.clone(), 10, &guard));
+    /// assert!(matches!(tree.delete(&key, &guard), Some(&10)));
+    /// ```
     pub fn delete<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
@@ -219,6 +254,18 @@ where
     }
 
     /// Get value associated with key.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// let key = "key".to_string();
+    /// assert!(tree.insert(key.clone(), 10, &guard));
+    /// assert!(matches!(tree.get(&key, &guard), Some(&10)));
+    /// ```
     pub fn get<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
@@ -231,7 +278,24 @@ where
 
     /// Create tree range scanner which will return values whose keys is in passed range.
     ///
-    /// Visibility of changes made in tree during scan described in [BzTree] doc.
+    /// Visibility of changes made in tree during scan, described in [BzTree] doc.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// tree.insert("key1".to_string(), 1, &guard);
+    /// tree.insert("key2".to_string(), 2, &guard);
+    /// tree.insert("key3".to_string(), 3, &guard);
+    ///
+    /// let mut scanner = tree.range("key1".to_string()..="key2".to_string(), &guard);
+    /// assert!(matches!(scanner.next(), Some((_, &1))));
+    /// assert!(matches!(scanner.next(), Some((_, &2))));
+    /// assert!(matches!(scanner.next(), None));
+    /// ```
     pub fn range<'g>(
         &'g self,
         // TODO: think how we can accept Q instead of K in range
@@ -247,23 +311,86 @@ where
     /// Create iterator through all key-values of tree.
     ///
     /// Iterator based on tree range scanner and have same changes visibility guarantees.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// tree.insert("key1".to_string(), 1, &guard);
+    /// tree.insert("key2".to_string(), 2, &guard);
+    /// tree.insert("key3".to_string(), 3, &guard);
+    ///
+    /// let mut scanner = tree.iter(&guard);
+    /// assert!(matches!(scanner.next(), Some((_, &1))));
+    /// assert!(matches!(scanner.next(), Some((_, &2))));
+    /// assert!(matches!(scanner.next(), Some((_, &3))));
+    /// assert!(matches!(scanner.next(), None));
+    /// ```
     pub fn iter<'g>(&'g self, guard: &'g Guard) -> impl DoubleEndedIterator<Item = (&'g K, &'g V)> {
         self.range(.., guard)
     }
 
     /// Return first element of tree according to key ordering.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// tree.insert("key1".to_string(), 1, &guard);
+    /// tree.insert("key2".to_string(), 2, &guard);
+    /// tree.insert("key3".to_string(), 3, &guard);
+    ///
+    /// assert!(matches!(tree.first(&guard), Some((_, &1))));
+    /// ```
     #[inline]
     pub fn first<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)> {
         self.iter(guard).next()
     }
 
     /// Return last element of tree according to key ordering.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// tree.insert("key1".to_string(), 1, &guard);
+    /// tree.insert("key2".to_string(), 2, &guard);
+    /// tree.insert("key3".to_string(), 3, &guard);
+    ///
+    /// assert!(matches!(tree.last(&guard), Some((_, &3))));
+    /// ```
     #[inline]
     pub fn last<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)> {
         self.iter(guard).rev().next()
     }
 
     /// Remove and return first element of tree according to key ordering.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// tree.insert("key1".to_string(), 1, &guard);
+    /// tree.insert("key2".to_string(), 2, &guard);
+    /// tree.insert("key3".to_string(), 3, &guard);
+    ///
+    /// assert!(matches!(tree.pop_first(&guard), Some((_, &1))));
+    /// assert!(matches!(tree.pop_first(&guard), Some((_, &2))));
+    /// assert!(matches!(tree.pop_first(&guard), Some((_, &3))));
+    /// assert!(matches!(tree.pop_first(&guard), None));
+    /// ```
     pub fn pop_first<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
         let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
         loop {
@@ -280,6 +407,23 @@ where
     }
 
     /// Remove and return last element of tree according to key ordering.
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// tree.insert("key1".to_string(), 1, &guard);
+    /// tree.insert("key2".to_string(), 2, &guard);
+    /// tree.insert("key3".to_string(), 3, &guard);
+    ///
+    /// assert!(matches!(tree.pop_last(&guard), Some((_, &3))));
+    /// assert!(matches!(tree.pop_last(&guard), Some((_, &2))));
+    /// assert!(matches!(tree.pop_last(&guard), Some((_, &1))));
+    /// assert!(matches!(tree.pop_last(&guard), None));
+    /// ```
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
         let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
         loop {
@@ -304,7 +448,30 @@ where
     /// Function `F` can be called several times in case of concurrent modification of tree.
     /// Because of this behaviour, function code should not modify global application state or
     /// such code should be carefully designed(understanding consequences of repeated function
-    /// calls for same key).    
+    /// calls for same key).
+    ///
+    /// # Examples
+    /// ```
+    /// use bztree::BzTree;
+    ///
+    /// let tree = BzTree::new();
+    /// let guard = crossbeam_epoch::pin();
+    ///
+    /// let key = "key".to_string();
+    /// tree.insert(key.clone(), 2, &guard);
+    ///
+    /// assert!(tree.compute(&key, |(_, v)| Some(v + 1), &guard));
+    /// assert!(matches!(tree.get(&key, &guard), Some(&3)));
+    ///
+    /// assert!(tree.compute(&key, |(_, v)| {
+    ///  if *v == 3 {
+    ///      None
+    ///  } else {
+    ///      Some(v + 1)
+    ///  }
+    /// }, &guard));
+    /// assert!(matches!(tree.get(&key, &guard), None));
+    /// ```    
     pub fn compute<'g, Q, F>(&'g self, key: &Q, mut new_val: F, guard: &'g Guard) -> bool
     where
         K: Borrow<Q>,
