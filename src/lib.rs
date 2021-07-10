@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// # Key-value trait bounds
 ///
-/// Keys should implement [Ord] and [Hash], values should be [Send] and [Sync].
+/// Keys should implement [Ord] and [Clone], values should be [Clone], [Send] and [Sync].
 ///
 /// Because of nature of concurrent trees, node split/merge operations are optimistic and can fail:
 /// implementation creates copy of nodes which is a part of split/merge process
@@ -69,7 +69,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// scanner doesn't provide snapshot view of tree.
 ///
 /// # Memory reclamation
-/// BzTree uses [crossbeam::epoch] memory reclamation to free memory of removed/replaced key-values.
+/// BzTree uses [crossbeam_epoch::Guard] memory reclamation to free memory of removed/replaced
+/// key-values.
 /// Because of internal representation of tree nodes, drop of some removed keys can be delayed
 /// until node split/merge. This limitation caused by 'sorted' space inside tree node which uses
 /// binary search to locate keys inside. Current implementation of binary search should have an
