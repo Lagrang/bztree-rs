@@ -393,6 +393,7 @@ where
     /// assert!(matches!(tree.pop_first(&guard), None));
     /// ```
     pub fn pop_first<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
+        // TODO: optimize priority queue like APIs
         let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
         loop {
             let key = if let Some((key, _)) = (unsafe { &*self_mut }).iter(guard).next() {
