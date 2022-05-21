@@ -275,6 +275,7 @@ impl<K: Ord, V> Node<K, V> {
         K: PartialOrd<Q>,
         V: Clone,
     {
+        // TODO: take immutable self ref in all node methods
         debug_assert!(self.readonly);
         if self.sorted_len == 0 {
             return None;

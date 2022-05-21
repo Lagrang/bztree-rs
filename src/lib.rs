@@ -118,13 +118,13 @@ macro_rules! tree_ref {
 }
 
 macro_rules! node_ref {
-    ($node: ident) => {
+    ($node: expr) => {
         unsafe { &*$node }
     };
 }
 
 macro_rules! node_mut {
-    ($node: ident) => {
+    ($node: expr) => {
         unsafe { &mut *$node }
     };
 }
@@ -168,7 +168,7 @@ where
         let mut value: V = value;
         let search_key = Key::new(key.clone());
         loop {
-            let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
+            let node = tree_mut!(self).find_leaf_for_key(&search_key, true, guard);
             match node_mut!(node).insert(key.clone(), value, guard) {
                 Ok(_) => {
                     return true;
@@ -216,7 +216,7 @@ where
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
+            let node = tree_mut!(self).find_leaf_for_key(&search_key, true, guard);
             match unsafe { (*node).upsert(key.clone(), value, guard) } {
                 Ok(prev_val) => {
                     return prev_val;
@@ -266,7 +266,7 @@ where
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
+            let node = tree_mut!(self).find_leaf_for_key(&search_key, false, guard);
             let len = unsafe { (*node).estimated_len(guard) };
             match unsafe { (*node).delete(key.borrow(), guard) } {
                 Ok(val) => {
@@ -300,7 +300,7 @@ where
         Q: Clone + Ord,
     {
         let search_key = Key::new(key.clone());
-        let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
+        let node = tree_mut!(self).find_leaf_for_key(&search_key, false, guard);
         node_ref!(node).get(key, guard).map(|(_, val, _, _)| val)
     }
 
@@ -455,7 +455,7 @@ where
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
         let max_key = Key::pos_infinite();
         loop {
-            let max_node = tree_mut!(self).find_leaf_for_key(&max_key, guard);
+            let max_node = tree_mut!(self).find_leaf_for_key(&max_key, false, guard);
             let node_status = node_ref!(max_node).status_word().read(guard);
             if let Some(max_entry) = node_ref!(max_node).conditional_last_kv(node_status, guard) {
                 // It's enough to only validate status word of leaf node to ensure that we pop
@@ -530,7 +530,7 @@ where
     {
         let search_key = Key::new(key.clone());
         loop {
-            let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
+            let node = tree_mut!(self).find_leaf_for_key(&search_key, false, guard);
             if let Some((found_key, val, status_word, value_index)) =
                 node_ref!(node).get(key, guard)
             {
@@ -572,6 +572,7 @@ where
                     }
                 }
             } else {
+                // TODO: add possibility to insert KV if not exists
                 return false;
             }
         }
@@ -666,7 +667,15 @@ where
             return if path.node_pointer.len(guard) == 0 {
                 // underflow node is empty and parent doesn't contain any other nodes,
                 // we can remove empty parent node from the tree
-                self.remove_empty_parent(&path, &parent, unfroze_on_fail, guard)
+                self.remove_empty_parent(
+                    TraversePath {
+                        parents: path.parents,
+                        node_pointer: parent.node_pointer,
+                        cas_pointer: parent.cas_pointer,
+                    },
+                    unfroze_on_fail,
+                    guard,
+                )
             } else {
                 // underflow node cannot be merged with siblings, try to merge parent with it
                 // sibling on their level. This give a chance later to merge current underflow node
@@ -751,24 +760,40 @@ where
     /// new grandparent inside tree.
     fn remove_empty_parent(
         &self,
-        path_to_node: &TraversePath<K, V>,
-        parent: &Parent<K, V>,
+        mut path_to_empty_node: TraversePath<K, V>,
         mut unfroze_on_fail: Vec<NodePointer<K, V>>,
         guard: &Guard,
     ) -> MergeResult<K, V> {
-        if let Some(gparent) = path_to_node.parents.last() {
-            let gparent_node = gparent.node_pointer.to_interim_node();
-            if !gparent_node.try_froze(guard) {
+        if let Some(parent_handle) = path_to_empty_node.parents.pop() {
+            let parent_node = parent_handle.node_pointer.to_interim_node();
+            if !parent_node.try_froze(guard) {
                 Self::unfroze(unfroze_on_fail);
                 return MergeResult::Retry;
             }
-            unfroze_on_fail.push(gparent.node_pointer.clone());
+            unfroze_on_fail.push(parent_handle.node_pointer.clone());
 
+            // Parent node contains 1 node which should be removed because it empty.
+            // We should recursively process this parent node because logically it empty. Then we
+            // found some grandparent node which is not empty, we remove all empty nodes from it.
+            // This will release all empty nodes found below it.
+            if parent_node.estimated_len(guard) == 1 {
+                return self.remove_empty_parent(
+                    TraversePath {
+                        parents: path_to_empty_node.parents,
+                        cas_pointer: parent_handle.cas_pointer,
+                        node_pointer: parent_handle.node_pointer,
+                    },
+                    unfroze_on_fail,
+                    guard,
+                );
+            }
+
+            // create copy of parent node without link to empty child
             let new_node = InterimNode::new_readonly(
-                gparent_node
+                parent_node
                     .iter(guard)
                     .filter_map(|(k, v)| {
-                        if k != &gparent.child_key {
+                        if k != &parent_handle.child_key {
                             Some((k.clone(), v.clone()))
                         } else {
                             None
@@ -778,8 +803,8 @@ where
             );
             let mut mwcas = MwCas::new();
             mwcas.compare_exchange(
-                gparent.cas_pointer,
-                gparent.node_pointer,
+                parent_handle.cas_pointer,
+                parent_handle.node_pointer,
                 NodePointer::new_interim(new_node),
             );
             if mwcas.exec(guard) {
@@ -790,12 +815,12 @@ where
             }
         } else {
             // Parent node is root and it contains only 1 link to empty child node, replace root
-            // node by empty leaf node.Parent node already frozen at this moment, simply replace
+            // node by empty leaf node. Parent node already frozen at this moment, simply replace
             // old parent by new root node.
             let mut mwcas = MwCas::new();
             mwcas.compare_exchange(
-                parent.cas_pointer,
-                parent.node_pointer,
+                path_to_empty_node.cas_pointer,
+                path_to_empty_node.node_pointer,
                 NodePointer::new_leaf(LeafNode::with_capacity(self.node_size as u16)),
             );
             if mwcas.exec(guard) {
@@ -1242,25 +1267,44 @@ where
     fn find_leaf_for_key<'g, Q>(
         &'g mut self,
         search_key: &Key<Q>,
+        create_if_not_exists: bool,
         guard: &'g Guard,
     ) -> *mut LeafNode<K, V>
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
+        let mut parent: Option<&mut NodePointer<K, V>> = None;
         let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
         loop {
             next_node = match next_node {
                 NodePointer::Interim(node) => {
-                    let (_, child_node_ptr) = node
-                        .closest_mut(search_key, guard)
-                        .expect("+Inf node should always exists in tree");
-                    child_node_ptr.read_mut(guard)
+                    let node_ptr = node as *const ArcInterimNode<K, V>;
+                    if let Some((_, child_node)) = node.closest_mut(search_key, guard) {
+                        child_node.read_mut(guard)
+                    } else if create_if_not_exists {
+                        let mut elems: Vec<(Key<K>, HeapPointer<NodePointer<K, V>>)> =
+                            node_ref!(node_ptr)
+                                .iter(guard)
+                                .map(|(key, val)| (key.clone(), val.clone()))
+                                .collect();
+                        if elems.is_empty() {
+                            // current interim is empty, help with merge
+                            self.remove_empty_parent();
+                        } else {
+                            // existing greatest node now will serve as +Inf node
+                            elems.last_mut().unwrap().0 = Key::pos_infinite();
+                        }
+                        return ptr::null_mut();
+                    } else {
+                        return ptr::null_mut();
+                    }
                 }
                 NodePointer::Leaf(node_ref) => {
                     return node_ref.deref_mut() as *mut LeafNode<K, V>;
                 }
-            }
+            };
+            parent = Some(next_node);
         }
     }
 }
@@ -1415,7 +1459,7 @@ enum NodePointer<K: Ord, V> {
     Interim(ArcInterimNode<K, V>),
 }
 
-impl<K: Ord + Clone, V> Clone for NodePointer<K, V> {
+impl<K: Ord, V> Clone for NodePointer<K, V> {
     fn clone(&self) -> Self {
         match self {
             NodePointer::Leaf(node) => NodePointer::Leaf(node.clone()),
@@ -1427,6 +1471,12 @@ impl<K: Ord + Clone, V> Clone for NodePointer<K, V> {
 unsafe impl<K: Ord, V> Send for NodePointer<K, V> {}
 
 unsafe impl<K: Ord, V> Sync for NodePointer<K, V> {}
+
+impl<K: Ord, V> From<ArcInterimNode<K, V>> for NodePointer<K, V> {
+    fn from(node: ArcInterimNode<K, V>) -> Self {
+        NodePointer::Interim(node)
+    }
+}
 
 impl<K: Ord, V> NodePointer<K, V> {
     #[inline]
