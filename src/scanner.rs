@@ -1,4 +1,4 @@
-use crate::node;
+use crate::node::NodeScanner;
 use crate::{InterimNode, Key, LeafNode, NodePointer};
 use crossbeam_epoch::Guard;
 use mwcas::HeapPointer;
@@ -14,8 +14,8 @@ pub struct Scanner<'g, K: Ord, V, Range> {
 }
 
 struct Iter<'g, K: Ord, V> {
-    interims: Vec<node::Scanner<'g, Key<K>, HeapPointer<NodePointer<K, V>>>>,
-    iter: Option<node::Scanner<'g, K, V>>,
+    interims: Vec<NodeScanner<'g, Key<K>, HeapPointer<NodePointer<K, V>>>>,
+    iter: Option<NodeScanner<'g, K, V>>,
     last_key: Option<&'g K>,
 }
 
@@ -79,7 +79,7 @@ impl<'g, K: Ord, V, Range> Scanner<'g, K, V, Range> {
         }
     }
 
-    fn next_leaf(&mut self) -> Option<node::Scanner<'g, K, V>>
+    fn next_leaf(&mut self) -> Option<NodeScanner<'g, K, V>>
     where
         Range: RangeBounds<K> + Clone + 'g,
         K: Ord + Clone,
@@ -121,7 +121,7 @@ impl<'g, K: Ord, V, Range> Scanner<'g, K, V, Range> {
         None
     }
 
-    fn next_leaf_rev(&mut self) -> Option<node::Scanner<'g, K, V>>
+    fn next_leaf_rev(&mut self) -> Option<NodeScanner<'g, K, V>>
     where
         Range: RangeBounds<K> + Clone + 'g,
         K: Ord + Clone,

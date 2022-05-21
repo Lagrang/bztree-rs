@@ -2,7 +2,7 @@
 //! Concurrent B-tree implementation based on paper
 //! [BzTree: A High-Performance Latch-free Range Index for Non-Volatile Memory](http://www.vldb.org/pvldb/vol11/p553-arulraj.pdf).
 //! Current implementation doesn't support non-volatile memory and supposed to be used only as
-//! in-memory(not persistent) data structure.  
+//! in-memory(not persistent) data structure.
 //! BzTree uses [MwCAS](https://crates.io/crates/mwcas) crate to get access to multi-word CAS.
 //!
 //! # Examples
@@ -49,7 +49,7 @@ use std::option::Option::Some;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// BzTree data structure.  
+/// BzTree data structure.
 ///
 /// # Key-value trait bounds
 ///
@@ -102,6 +102,18 @@ type LeafNode<K, V> = Node<K, V>;
 /// which keys greater than any other key in current interim node.
 type InterimNode<K, V> = Node<Key<K>, HeapPointer<NodePointer<K, V>>>;
 
+macro_rules! self_mut {
+    ($s: ident) => {
+        unsafe { &mut *($s as *const BzTree<K, V> as *mut BzTree<K, V>) }
+    };
+}
+
+macro_rules! self_ref {
+    ($s: ident) => {
+        unsafe { &*($s as *const BzTree<K, V>) }
+    };
+}
+
 impl<K, V> BzTree<K, V>
 where
     K: Clone + Ord,
@@ -138,10 +150,10 @@ where
     /// assert!(!tree.insert(key.clone(), 5, &guard));
     /// ```
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
-        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         let mut value: V = value;
         loop {
-            let node = self_mut.find_leaf_mut(&key, guard);
+            let search_key = Key::new(key.clone());
+            let node = self_mut!(self).find_leaf_mut(search_key, guard);
             match node.insert(key.clone(), value, guard) {
                 Ok(_) => {
                     return true;
@@ -184,12 +196,11 @@ where
     /// assert!(matches!(tree.upsert(key.clone(), 11, &guard), Some(10)));
     /// ```
     pub fn upsert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
-        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         let mut value: V = value;
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = self_mut.find_leaf_ptr(&key, &guard);
+            let node = self_mut!(self).find_leaf_ptr(&key, guard);
             match unsafe { (*node).upsert(key.clone(), value, guard) } {
                 Ok(prev_val) => {
                     return prev_val;
@@ -235,11 +246,10 @@ where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
-        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = self_mut.find_leaf_ptr(key, guard);
+            let node = self_mut!(self).find_leaf_ptr(key, guard);
             let len = unsafe { (*node).estimated_len(guard) };
             match unsafe { (*node).delete(key.borrow(), guard) } {
                 Ok(val) => {
@@ -272,8 +282,8 @@ where
         K: Borrow<Q>,
         Q: Clone + Ord,
     {
-        self.find_leaf(&key, guard)
-            .get(&key, guard)
+        self.find_leaf(key, guard)
+            .get(key, guard)
             .map(|(_, val, _, _)| val)
     }
 
@@ -394,15 +404,14 @@ where
     /// ```
     pub fn pop_first<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
         // TODO: optimize priority queue like APIs
-        let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
         loop {
-            let key = if let Some((key, _)) = (unsafe { &*self_mut }).iter(guard).next() {
+            let key = if let Some((key, _)) = self_ref!(self).iter(guard).next() {
                 key.clone()
             } else {
                 return None;
             };
 
-            if let Some(val) = (unsafe { &mut *self_mut }).delete(&key, guard) {
+            if let Some(val) = self_mut!(self).delete(&key, guard) {
                 return Some((key, val));
             }
         }
@@ -427,15 +436,17 @@ where
     /// assert!(matches!(tree.pop_last(&guard), None));
     /// ```
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
         loop {
-            let key = if let Some((key, _)) = (unsafe { &*self_mut }).iter(guard).rev().next() {
+            let search_key = Key::pos_infinite();
+            let max_node = self_mut!(self).find_leaf_mut(search_key, guard);
+            // max_node.
+            let key = if let Some((key, _)) = self_ref!(self).iter(guard).rev().next() {
                 key.clone()
             } else {
                 return None;
             };
 
-            if let Some(val) = (unsafe { &mut *self_mut }).delete(&key, guard) {
+            if let Some(val) = self_mut!(self).delete(&key, guard) {
                 return Some((key, val));
             }
         }
@@ -473,16 +484,15 @@ where
     ///  }
     /// }, &guard));
     /// assert!(matches!(tree.get(&key, &guard), None));
-    /// ```    
+    /// ```
     pub fn compute<'g, Q, F>(&'g self, key: &Q, mut new_val: F, guard: &'g Guard) -> bool
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
         F: FnMut((&K, &V)) -> Option<V>,
     {
-        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         loop {
-            let node = self_mut.find_leaf_ptr(key, guard);
+            let node = self_mut!(self).find_leaf_ptr(key, guard);
             if let Some((found_key, val, status_word, value_index)) =
                 unsafe { (*node).get(key, guard) }
             {
@@ -1168,7 +1178,7 @@ where
                 parent_pointer @ NodePointer::Interim(_) => {
                     let (child_node_key, child_node_ptr) = parent_pointer
                         .to_interim_node()
-                        .closest(&search_key, guard)
+                        .closest(search_key, guard)
                         .expect("+Inf node should always exists in tree");
                     parents.push(Parent {
                         cas_pointer: next_node,
@@ -1191,14 +1201,14 @@ where
     /// Find leaf node which can contain passed key
     fn find_leaf_mut<'g, Q>(
         &'g mut self,
-        search_key: &Q,
+        search_key: Key<Q>,
         guard: &'g Guard,
     ) -> &'g mut LeafNode<K, V>
     where
         K: Borrow<Q>,
         Q: Clone + Ord,
     {
-        let search_key = Key::new(search_key.clone());
+        // let search_key = Key::new(search_key.clone());
         let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
         loop {
             next_node = match next_node {

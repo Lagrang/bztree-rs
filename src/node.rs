@@ -396,28 +396,30 @@ impl<K: Ord, V> Node<K, V> {
         [left, right]
     }
 
-    pub fn range<'g, Q, Range>(&'g self, key_range: Range, guard: &'g Guard) -> Scanner<K, V>
+    pub fn range<'g, Q, Range>(&'g self, key_range: Range, guard: &'g Guard) -> NodeScanner<K, V>
     where
         K: Ord + Borrow<Q>,
         Q: Ord + 'g,
         Range: RangeBounds<Q> + 'g,
     {
-        Scanner::new(self.status_word.read(guard), &self, key_range, guard)
+        NodeScanner::new(self.status_word.read(guard), &self, key_range, guard)
     }
 
-    pub fn iter<'g>(&'g self, guard: &'g Guard) -> Scanner<K, V>
+    pub fn iter<'g>(&'g self, guard: &'g Guard) -> NodeScanner<K, V>
     where
         K: Ord,
     {
         self.range(.., guard)
     }
 
-    pub fn last_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    pub fn conditional_last_kv<'g>(
+        &'g self,
+        status_word: &StatusWord,
+        guard: &'g Guard,
+    ) -> Option<(&'g K, &'g V)>
     where
         K: Ord,
     {
-        let status_word = self.status_word().read(guard);
-
         let mut unsorted_max: Option<&Entry<K, V>> = None;
         if self.sorted_len < status_word.reserved_records() as usize {
             // scan unsorted part first because it contain most recent values
@@ -474,12 +476,22 @@ impl<K: Ord, V> Node<K, V> {
         return max_kv.map(|kv| unsafe { (kv.key(), kv.value()) });
     }
 
-    pub fn first_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    pub fn last_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Ord,
     {
         let status_word = self.status_word().read(guard);
+        return self.conditional_last_kv(status_word, guard);
+    }
 
+    pub fn conditional_first_kv<'g>(
+        &'g self,
+        status_word: &StatusWord,
+        guard: &'g Guard,
+    ) -> Option<(&'g K, &'g V)>
+    where
+        K: Ord,
+    {
         let mut unsorted_min: Option<&Entry<K, V>> = None;
         if self.sorted_len < status_word.reserved_records() as usize {
             // scan unsorted part first because it contain most recent values
@@ -533,6 +545,14 @@ impl<K: Ord, V> Node<K, V> {
             }
         };
         return min_kv.map(|kv| unsafe { (kv.key(), kv.value()) });
+    }
+
+    pub fn first_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
+    where
+        K: Ord,
+    {
+        let status_word = self.status_word().read(guard);
+        return self.conditional_first_kv(status_word, guard);
     }
 
     pub fn split_leaf(&self, guard: &Guard) -> SplitMode<K, V>
@@ -1094,7 +1114,7 @@ impl<K, V> Entry<K, V> {
     }
 }
 
-pub struct Scanner<'a, K: Ord, V> {
+pub struct NodeScanner<'a, K: Ord, V> {
     node: &'a Node<K, V>,
     // BzTree node can allocate maximum u16::MAX records,
     // use u16 instead of usize to reduce size of scanner
@@ -1103,7 +1123,7 @@ pub struct Scanner<'a, K: Ord, V> {
     rev_idx: u16,
 }
 
-impl<'a, K, V> Scanner<'a, K, V>
+impl<'a, K, V> NodeScanner<'a, K, V>
 where
     K: Ord,
 {
@@ -1189,7 +1209,7 @@ where
         }
 
         if kvs.is_empty() {
-            return Scanner {
+            return NodeScanner {
                 // move 'forward' index in front of 'reversed' to simulate empty scanner
                 fwd_idx: 1,
                 rev_idx: 0,
@@ -1198,7 +1218,7 @@ where
             };
         }
 
-        Scanner {
+        NodeScanner {
             fwd_idx: 0,
             rev_idx: (kvs.len() - 1) as u16,
             kv_indexes: kvs,
@@ -1227,7 +1247,7 @@ where
     }
 }
 
-impl<'a, K: Ord, V> Iterator for Scanner<'a, K, V> {
+impl<'a, K: Ord, V> Iterator for NodeScanner<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1251,7 +1271,7 @@ impl<'a, K: Ord, V> Iterator for Scanner<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord, V> DoubleEndedIterator for Scanner<'a, K, V> {
+impl<'a, K: Ord, V> DoubleEndedIterator for NodeScanner<'a, K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.rev_idx >= self.fwd_idx {
             let index = self.kv_indexes[self.rev_idx as usize] as usize;
@@ -1271,7 +1291,7 @@ impl<'a, K: Ord, V> DoubleEndedIterator for Scanner<'a, K, V> {
     }
 }
 
-impl<'a, K: Ord, V> ExactSizeIterator for Scanner<'a, K, V> {
+impl<'a, K: Ord, V> ExactSizeIterator for NodeScanner<'a, K, V> {
     fn len(&self) -> usize {
         self.size_hint().0
     }
