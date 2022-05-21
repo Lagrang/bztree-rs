@@ -102,15 +102,27 @@ type LeafNode<K, V> = Node<K, V>;
 /// which keys greater than any other key in current interim node.
 type InterimNode<K, V> = Node<Key<K>, HeapPointer<NodePointer<K, V>>>;
 
-macro_rules! self_mut {
+macro_rules! tree_mut {
     ($s: ident) => {
         unsafe { &mut *($s as *const BzTree<K, V> as *mut BzTree<K, V>) }
     };
 }
 
-macro_rules! self_ref {
+macro_rules! tree_ref {
     ($s: ident) => {
         unsafe { &*($s as *const BzTree<K, V>) }
+    };
+}
+
+macro_rules! node_ref {
+    ($node: ident) => {
+        unsafe { &*$node }
+    };
+}
+
+macro_rules! node_mut {
+    ($node: ident) => {
+        unsafe { &mut *$node }
     };
 }
 
@@ -151,10 +163,10 @@ where
     /// ```
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
         let mut value: V = value;
+        let search_key = Key::new(key.clone());
         loop {
-            let search_key = Key::new(key.clone());
-            let node = self_mut!(self).find_leaf_mut(search_key, guard);
-            match node.insert(key.clone(), value, guard) {
+            let node = tree_mut!(self).find_leaf(&search_key, guard);
+            match node_mut!(node).insert(key.clone(), value, guard) {
                 Ok(_) => {
                     return true;
                 }
@@ -162,7 +174,7 @@ where
                     value = val;
                     // try to find path to overflowed node
                     let leaf_ptr = node as *const LeafNode<K, V>;
-                    let path = self.find_node_for_key(&key, guard);
+                    let path = self.find_path_to_key(&search_key, guard);
                     if let NodePointer::Leaf(found_leaf) = path.node_pointer {
                         // if overflowed node is not split/merged by other thread during insert
                         if ptr::eq(leaf_ptr, found_leaf.deref()) {
@@ -197,10 +209,11 @@ where
     /// ```
     pub fn upsert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
         let mut value: V = value;
+        let search_key = Key::new(key.clone());
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = self_mut!(self).find_leaf_ptr(&key, guard);
+            let node = tree_mut!(self).find_leaf(&search_key, guard);
             match unsafe { (*node).upsert(key.clone(), value, guard) } {
                 Ok(prev_val) => {
                     return prev_val;
@@ -208,7 +221,7 @@ where
                 Err(InsertError::Split(val)) => {
                     value = val;
                     // try to find path to overflowed node
-                    let path = self.find_node_for_key(&key, guard);
+                    let path = self.find_path_to_key(&search_key, guard);
                     if let NodePointer::Leaf(found_leaf) = path.node_pointer {
                         // if overflowed node is not split/merged by other thread
                         if ptr::eq(node, found_leaf.deref()) {
@@ -246,15 +259,16 @@ where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
+        let search_key = Key::new(key.clone());
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = self_mut!(self).find_leaf_ptr(key, guard);
+            let node = tree_mut!(self).find_leaf(&search_key, guard);
             let len = unsafe { (*node).estimated_len(guard) };
             match unsafe { (*node).delete(key.borrow(), guard) } {
                 Ok(val) => {
                     if self.should_merge(len - 1) {
-                        self.merge_recursive(key, guard);
+                        self.merge_recursive(&search_key, guard);
                     }
                     return Some(val);
                 }
@@ -282,9 +296,9 @@ where
         K: Borrow<Q>,
         Q: Clone + Ord,
     {
-        self.find_leaf(key, guard)
-            .get(key, guard)
-            .map(|(_, val, _, _)| val)
+        let search_key = Key::new(key.clone());
+        let node = tree_mut!(self).find_leaf(&search_key, guard);
+        node_ref!(node).get(key, guard).map(|(_, val, _, _)| val)
     }
 
     /// Create tree range scanner which will return values whose keys is in passed range.
@@ -405,13 +419,13 @@ where
     pub fn pop_first<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
         // TODO: optimize priority queue like APIs
         loop {
-            let key = if let Some((key, _)) = self_ref!(self).iter(guard).next() {
+            let key = if let Some((key, _)) = tree_ref!(self).iter(guard).next() {
                 key.clone()
             } else {
                 return None;
             };
 
-            if let Some(val) = self_mut!(self).delete(&key, guard) {
+            if let Some(val) = tree_mut!(self).delete(&key, guard) {
                 return Some((key, val));
             }
         }
@@ -436,18 +450,38 @@ where
     /// assert!(matches!(tree.pop_last(&guard), None));
     /// ```
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
+        let max_key = Key::pos_infinite();
         loop {
-            let search_key = Key::pos_infinite();
-            let max_node = self_mut!(self).find_leaf_mut(search_key, guard);
-            // max_node.
-            let key = if let Some((key, _)) = self_ref!(self).iter(guard).rev().next() {
-                key.clone()
+            let max_node = tree_mut!(self).find_leaf(&max_key, guard);
+            let node_status = node_ref!(max_node).status_word().read(guard);
+            if let Some(max_entry) = node_ref!(max_node).conditional_last_kv(node_status, guard) {
+                // It's enough to only validate status word of leaf node to ensure that we pop
+                // current max element. While pop in progress, other threads can change tree
+                // shape by merge and split.
+                // If node which currently contains min/max element is merged/split, we will
+                // detect such change by checking node's status word.
+                // Merging of parent node also can proceed without additional validation
+                // because merge of parent do not change ordering of leaf elements.
+                // Split of parent node have 2 cases:
+                // 1. split caused by overflow of other leaf node(e.g., not current min/max node).
+                // In this case min or max node still contain min/max value and can be used for
+                // pop operation.
+                // 2. split caused by overflow of current min/max node.
+                // This case covered by status word validation.
+                if node_mut!(max_node)
+                    .conditional_delete(node_status, max_entry.location, guard)
+                    .is_ok()
+                {
+                    return Some((max_entry.key.clone(), max_entry.value));
+                }
             } else {
-                return None;
-            };
-
-            if let Some(val) = self_mut!(self).delete(&key, guard) {
-                return Some((key, val));
+                if self.root.read(guard).points_to(max_node) {
+                    // current max/min node is empty and it is the root of tree
+                    return None;
+                }
+                // node which should contain +Inf key currently is empty
+                // we should help to merge such node and try again
+                self.merge_recursive(&max_key, guard);
             }
         }
     }
@@ -491,21 +525,25 @@ where
         Q: Ord + Clone,
         F: FnMut((&K, &V)) -> Option<V>,
     {
+        let search_key = Key::new(key.clone());
         loop {
-            let node = self_mut!(self).find_leaf_ptr(key, guard);
+            let node = tree_mut!(self).find_leaf(&search_key, guard);
             if let Some((found_key, val, status_word, value_index)) =
-                unsafe { (*node).get(key, guard) }
+                node_ref!(node).get(key, guard)
             {
                 if let Some(new_val) = new_val((found_key, val)) {
-                    match unsafe {
-                        (*node).conditional_upsert(found_key.clone(), new_val, status_word, guard)
-                    } {
+                    match node_mut!(node).conditional_upsert(
+                        found_key.clone(),
+                        new_val,
+                        status_word,
+                        guard,
+                    ) {
                         Ok(_) => {
                             return true;
                         }
                         Err(InsertError::Split(_)) => {
                             // try to find path to overflowed node
-                            let path = self.find_node_for_key(key, guard);
+                            let path = self.find_path_to_key(&search_key, guard);
                             if let NodePointer::Leaf(found_leaf) = path.node_pointer {
                                 // if overflowed node is not split/merged by other thread
                                 if ptr::eq(node, found_leaf.deref()) {
@@ -519,11 +557,11 @@ where
                         Err(InsertError::Retry(_)) | Err(InsertError::NodeFrozen(_)) => {}
                     };
                 } else {
-                    let len = unsafe { (*node).estimated_len(guard) };
-                    match unsafe { (*node).conditional_delete(status_word, value_index, guard) } {
+                    let len = node_ref!(node).estimated_len(guard);
+                    match node_mut!(node).conditional_delete(status_word, value_index, guard) {
                         Ok(_) => {
                             if self.should_merge(len - 1) {
-                                self.merge_recursive(key, guard);
+                                self.merge_recursive(&search_key, guard);
                             }
                             return true;
                         }
@@ -541,13 +579,13 @@ where
         node_size <= self.node_size / 3
     }
 
-    fn merge_recursive<Q>(&self, key: &Q, guard: &Guard)
+    fn merge_recursive<Q>(&self, key: &Key<Q>, guard: &Guard)
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
         loop {
-            let path = self.find_node_for_key(key, guard);
+            let path = self.find_path_to_key(key, guard);
             match self.merge(path, guard) {
                 MergeResult::Completed => break,
                 MergeResult::Retry => {}
@@ -1148,20 +1186,6 @@ where
     }
 
     /// Find node(with traversal path from root) which can contain passed key
-    fn find_node_for_key<'g, Q>(
-        &'g self,
-        search_key: &Q,
-        guard: &'g Guard,
-    ) -> TraversePath<'g, K, V>
-    where
-        K: Borrow<Q>,
-        Q: Clone + Ord,
-    {
-        let search_key = Key::new(search_key.clone());
-        self.find_path_to_key(&search_key, guard)
-    }
-
-    /// Find node(with traversal path from root) which can contain passed key
     fn find_path_to_key<'g, Q>(
         &'g self,
         search_key: &Key<Q>,
@@ -1199,67 +1223,17 @@ where
     }
 
     /// Find leaf node which can contain passed key
-    fn find_leaf_mut<'g, Q>(
-        &'g mut self,
-        search_key: Key<Q>,
-        guard: &'g Guard,
-    ) -> &'g mut LeafNode<K, V>
-    where
-        K: Borrow<Q>,
-        Q: Clone + Ord,
-    {
-        // let search_key = Key::new(search_key.clone());
-        let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
-        loop {
-            next_node = match next_node {
-                NodePointer::Interim(node) => {
-                    let (_, child_node_ptr) = node
-                        .closest_mut(&search_key, guard)
-                        .expect("+Inf node should always exists in tree");
-                    child_node_ptr.read_mut(guard)
-                }
-                NodePointer::Leaf(node) => {
-                    return node;
-                }
-            }
-        }
-    }
-
-    /// Find leaf node which can contain passed key
-    fn find_leaf<'g, Q>(&'g self, search_key: &Q, guard: &'g Guard) -> &'g LeafNode<K, V>
-    where
-        K: Borrow<Q>,
-        Q: Clone + Ord,
-    {
-        let search_key = Key::new(search_key.clone());
-        let mut next_node: &NodePointer<K, V> = self.root.read(guard);
-        loop {
-            next_node = match next_node {
-                NodePointer::Interim(node) => {
-                    let (_, child_node_ptr) = node
-                        .closest(&search_key, guard)
-                        .expect("+Inf node should always exists in tree");
-                    child_node_ptr.read(guard)
-                }
-                NodePointer::Leaf(node_ref) => {
-                    return node_ref;
-                }
-            }
-        }
-    }
-
-    fn find_leaf_ptr<'g, Q>(&'g mut self, search_key: &Q, guard: &'g Guard) -> *mut LeafNode<K, V>
+    fn find_leaf<'g, Q>(&'g mut self, search_key: &Key<Q>, guard: &'g Guard) -> *mut LeafNode<K, V>
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
-        let search_key = Key::new(search_key.clone());
         let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
         loop {
             next_node = match next_node {
                 NodePointer::Interim(node) => {
                     let (_, child_node_ptr) = node
-                        .closest_mut(&search_key, guard)
+                        .closest_mut(search_key, guard)
                         .expect("+Inf node should always exists in tree");
                     child_node_ptr.read_mut(guard)
                 }
@@ -1442,6 +1416,14 @@ impl<K: Ord, V> NodePointer<K, V> {
     fn new_interim(node: InterimNode<K, V>) -> NodePointer<K, V> {
         let interim_node = ArcInterimNode::new(node);
         NodePointer::Interim(interim_node)
+    }
+
+    #[inline]
+    fn points_to(&self, node_ptr: *mut LeafNode<K, V>) -> bool {
+        match self {
+            NodePointer::Interim(_) => false,
+            NodePointer::Leaf(node) => node.node == node_ptr,
+        }
     }
 
     #[inline]
@@ -2051,7 +2033,8 @@ mod tests {
         }
 
         for i in (0..count).rev() {
-            assert!(matches!(tree.pop_last(&guard), Some((k, _)) if k == Key::new(i)));
+            let res = tree.pop_last(&guard);
+            assert!(matches!(res, Some((k, _)) if k == Key::new(i)));
         }
 
         assert!(tree.iter(&guard).next().is_none());

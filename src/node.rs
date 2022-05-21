@@ -416,11 +416,11 @@ impl<K: Ord, V> Node<K, V> {
         &'g self,
         status_word: &StatusWord,
         guard: &'g Guard,
-    ) -> Option<(&'g K, &'g V)>
+    ) -> Option<EntryWithLoc<'g, K, V>>
     where
         K: Ord,
     {
-        let mut unsorted_max: Option<&Entry<K, V>> = None;
+        let mut unsorted_max: Option<EntryWithLoc<K, V>> = None;
         if self.sorted_len < status_word.reserved_records() as usize {
             // scan unsorted part first because it contain most recent values
             for index in self.sorted_len..status_word.reserved_records() as usize {
@@ -435,14 +435,24 @@ impl<K: Ord, V> Node<K, V> {
                 if metadata.is_visible() {
                     let key = unsafe { entry.key() };
                     unsorted_max = unsorted_max
-                        .map(|max_kv| {
-                            if key > unsafe { max_kv.key() } {
-                                entry
+                        .map(|max| {
+                            if key > max.key {
+                                EntryWithLoc {
+                                    location: index,
+                                    key,
+                                    value: unsafe { entry.value() },
+                                }
                             } else {
-                                max_kv
+                                max
                             }
                         })
-                        .or_else(|| Some(entry));
+                        .or_else(|| {
+                            Some(EntryWithLoc {
+                                location: index,
+                                key,
+                                value: unsafe { entry.value() },
+                            })
+                        });
                 }
             }
         }
@@ -453,27 +463,32 @@ impl<K: Ord, V> Node<K, V> {
             .filter_map(|entry| {
                 let metadata: Metadata = entry.metadata.read(guard).into();
                 if metadata.is_visible() {
-                    Some(entry)
+                    Some(EntryWithLoc {
+                        key: unsafe { entry.key() },
+                        value: unsafe { entry.value() },
+                        location: self.sorted_len - 1,
+                    })
                 } else {
                     None
                 }
             })
             .next();
 
-        let max_kv = if sorted_max.is_none() {
+        if sorted_max.is_none() {
             unsorted_max
         } else if unsorted_max.is_none() {
             sorted_max
         } else {
-            let sorted_key = unsafe { sorted_max.unwrap().key() };
-            let unsorted_key = unsafe { unsorted_max.unwrap().key() };
+            let sorted_max = sorted_max.unwrap();
+            let sorted_key = sorted_max.key;
+            let unsorted_max = unsorted_max.unwrap();
+            let unsorted_key = unsorted_max.key;
             if sorted_key > unsorted_key {
-                sorted_max
+                Some(sorted_max)
             } else {
-                unsorted_max
+                Some(unsorted_max)
             }
-        };
-        return max_kv.map(|kv| unsafe { (kv.key(), kv.value()) });
+        }
     }
 
     pub fn last_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
@@ -481,7 +496,9 @@ impl<K: Ord, V> Node<K, V> {
         K: Ord,
     {
         let status_word = self.status_word().read(guard);
-        return self.conditional_last_kv(status_word, guard);
+        return self
+            .conditional_last_kv(status_word, guard)
+            .map(|kv| (kv.key, kv.value));
     }
 
     pub fn conditional_first_kv<'g>(
@@ -1052,6 +1069,12 @@ where
         }
         Ok(())
     }
+}
+
+pub struct EntryWithLoc<'a, K, V> {
+    pub key: &'a K,
+    pub value: &'a V,
+    pub location: usize,
 }
 
 struct Entry<K, V> {
