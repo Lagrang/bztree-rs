@@ -737,8 +737,8 @@ impl<K: Ord, V> Node<K, V> {
     }
 
     /// Estimated length of node. If no updates/deleted were applied to node,
-    /// method return exact length(e.g. read only nodes should use this method
-    /// to obtain exact length because it very cheap).
+    /// method return exact length. Read-only nodes should use this method
+    /// to obtain exact length.
     #[inline(always)]
     pub fn estimated_len(&self, guard: &Guard) -> usize {
         let status_word: &StatusWord = self.status_word.read(guard);

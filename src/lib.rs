@@ -34,6 +34,8 @@
 //! assert!(matches!(tree.get(&key2, &guard), None));
 //! ```
 
+extern crate core;
+
 mod node;
 mod scanner;
 mod status_word;
@@ -90,6 +92,7 @@ pub struct BzTree<K: Ord, V> {
 }
 
 unsafe impl<K: Ord, V> Send for BzTree<K, V> {}
+
 unsafe impl<K: Ord, V> Sync for BzTree<K, V> {}
 
 /// Leaf node of tree actually store KV pairs.
@@ -165,7 +168,7 @@ where
         let mut value: V = value;
         let search_key = Key::new(key.clone());
         loop {
-            let node = tree_mut!(self).find_leaf(&search_key, guard);
+            let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
             match node_mut!(node).insert(key.clone(), value, guard) {
                 Ok(_) => {
                     return true;
@@ -213,7 +216,7 @@ where
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = tree_mut!(self).find_leaf(&search_key, guard);
+            let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
             match unsafe { (*node).upsert(key.clone(), value, guard) } {
                 Ok(prev_val) => {
                     return prev_val;
@@ -263,7 +266,7 @@ where
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = tree_mut!(self).find_leaf(&search_key, guard);
+            let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
             let len = unsafe { (*node).estimated_len(guard) };
             match unsafe { (*node).delete(key.borrow(), guard) } {
                 Ok(val) => {
@@ -297,7 +300,7 @@ where
         Q: Clone + Ord,
     {
         let search_key = Key::new(key.clone());
-        let node = tree_mut!(self).find_leaf(&search_key, guard);
+        let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
         node_ref!(node).get(key, guard).map(|(_, val, _, _)| val)
     }
 
@@ -452,7 +455,7 @@ where
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
         let max_key = Key::pos_infinite();
         loop {
-            let max_node = tree_mut!(self).find_leaf(&max_key, guard);
+            let max_node = tree_mut!(self).find_leaf_for_key(&max_key, guard);
             let node_status = node_ref!(max_node).status_word().read(guard);
             if let Some(max_entry) = node_ref!(max_node).conditional_last_kv(node_status, guard) {
                 // It's enough to only validate status word of leaf node to ensure that we pop
@@ -527,7 +530,7 @@ where
     {
         let search_key = Key::new(key.clone());
         loop {
-            let node = tree_mut!(self).find_leaf(&search_key, guard);
+            let node = tree_mut!(self).find_leaf_for_key(&search_key, guard);
             if let Some((found_key, val, status_word, value_index)) =
                 node_ref!(node).get(key, guard)
             {
@@ -586,14 +589,15 @@ where
     {
         loop {
             let path = self.find_path_to_key(key, guard);
-            match self.merge(path, guard) {
+            match self.merge_node(path, guard) {
                 MergeResult::Completed => break,
                 MergeResult::Retry => {}
                 MergeResult::RecursiveMerge(path) => {
                     // repeat until we try recursively merge parent nodes(until we find root
                     // or some parent cannot be merged).
                     let mut merge_path = path;
-                    while let MergeResult::RecursiveMerge(path) = self.merge(merge_path, guard) {
+                    while let MergeResult::RecursiveMerge(path) = self.merge_node(merge_path, guard)
+                    {
                         merge_path = path;
                     }
                 }
@@ -601,30 +605,35 @@ where
         }
     }
 
-    fn merge<'g>(
+    fn merge_node<'g>(
         &'g self,
         mut path: TraversePath<'g, K, V>,
         guard: &'g Guard,
     ) -> MergeResult<'g, K, V> {
+        // obtain direct parent of merging node
         let parent = path.parents.pop();
         if parent.is_none() {
             return self.merge_root(path.node_pointer, guard);
         }
 
-        // freeze node to ensure that no one can modify it
+        // freeze underflow node to ensure that no one can modify it
         if !path.node_pointer.try_froze() {
-            // this node can be:
+            // can't froze node because it:
             // - already merged/split
             // - replaced by new one(in case of interim nodes)
             // - temporary frozen by 'merge with sibling' method
             return MergeResult::Retry;
         }
 
+        // this vector will contain all nodes which are frozen during merge process
+        // if merge will fail for some reason, all these nodes should be unfrozen
+        // because they still present in the tree.
         let mut unfroze_on_fail = vec![path.node_pointer.clone()];
 
         match path.node_pointer {
             NodePointer::Leaf(node) => {
-                // between merge retries, node can receive new KVs and stopped being underutilized
+                // merge is not required anymore, node received new KVs
+                // while we tried to merge it
                 if !self.should_merge(node.estimated_len(guard)) {
                     Self::unfroze(unfroze_on_fail);
                     return MergeResult::Completed;
@@ -647,39 +656,46 @@ where
         }
         unfroze_on_fail.push(parent.node_pointer.clone());
 
-        // if node became empty and parent has no links to other nodes and this is not a special
-        // +Inf node, we should remove parent from grandparent.
-        if parent.node().estimated_len(guard) <= 1
-            && path.node_pointer.len(guard) == 0
-            && parent.child_key != Key::pos_infinite()
-        {
-            return self.remove_empty_parent(&path, &parent, unfroze_on_fail, guard);
-        }
+        // start merging underflow node with sibling will return 'new parent' node.
+        // This 'new parent' doesn't contain underutilized node. This 'new parent' node should be
+        // installed in grandparent node by replacing 'current parent' node pointer with pointer
+        // to 'new parent' node.
 
-        let new_parent = {
-            // merge with sibling will return new parent node. This new parent doesn't contain
-            // underutilized node. This new parent node should be installed in grandparent node
-            // by replacing current parent node pointer with pointer to new parent node.
-            if parent.node().estimated_len(guard) <= 1 {
-                // no siblings in parent node, try to merge parent with sibling on it's level.
+        // if no siblings in parent node
+        if parent.node().estimated_len(guard) <= 1 {
+            return if path.node_pointer.len(guard) == 0 {
+                // underflow node is empty and parent doesn't contain any other nodes,
+                // we can remove empty parent node from the tree
+                self.remove_empty_parent(&path, &parent, unfroze_on_fail, guard)
+            } else {
+                // underflow node cannot be merged with siblings, try to merge parent with it
+                // sibling on their level. This give a chance later to merge current underflow node
+                // with sibling node from another parent.
                 Self::unfroze(unfroze_on_fail);
-                return MergeResult::RecursiveMerge(TraversePath {
+                MergeResult::RecursiveMerge(TraversePath {
                     cas_pointer: parent.cas_pointer,
                     node_pointer: parent.node_pointer,
                     parents: path.parents,
-                });
-            }
+                })
+            };
+        }
 
-            match self.merge_with_sibling(path.node_pointer, &parent, &mut unfroze_on_fail, guard) {
-                Ok(new_parent) => new_parent,
-                Err(e) => {
-                    Self::unfroze(unfroze_on_fail);
-                    return e;
-                }
+        // merge underflow node with one of its siblings
+        let new_parent = match self.merge_with_sibling(
+            path.node_pointer,
+            &parent,
+            &mut unfroze_on_fail,
+            guard,
+        ) {
+            Ok(new_parent) => new_parent,
+            Err(e) => {
+                Self::unfroze(unfroze_on_fail);
+                return e;
             }
         };
 
-        let merge_new_parent = self.should_merge(new_parent.estimated_len(guard));
+        // check that parent node is also underflow and should be merged on it's own level
+        let new_parent_should_merge = self.should_merge(new_parent.estimated_len(guard));
 
         let mut mwcas = MwCas::new();
         // if parent node has grandparent node, then check that grandparent not frozen.
@@ -713,7 +729,7 @@ where
             // we try to merge parent only after original node merged, this will provide
             // bottom-up merge until we reach root.
 
-            if merge_new_parent {
+            if new_parent_should_merge {
                 let new_parent_ptr = parent.cas_pointer.read(guard);
                 return MergeResult::RecursiveMerge(TraversePath {
                     cas_pointer: parent.cas_pointer,
@@ -830,7 +846,7 @@ where
     ) -> Result<InterimNode<K, V>, MergeResult<K, V>> {
         let mut siblings: Vec<(Key<K>, &NodePointer<K, V>)> = Vec::with_capacity(2);
         let node_key = &parent.child_key;
-        let sibling_array = parent.node().get_siblings(&node_key, guard);
+        let sibling_array = parent.node().get_siblings(node_key, guard);
         for i in 0..sibling_array.len() {
             if let Some((key, sibling)) = sibling_array[i] {
                 siblings.push((key.clone(), sibling.read(guard)));
@@ -1223,7 +1239,11 @@ where
     }
 
     /// Find leaf node which can contain passed key
-    fn find_leaf<'g, Q>(&'g mut self, search_key: &Key<Q>, guard: &'g Guard) -> *mut LeafNode<K, V>
+    fn find_leaf_for_key<'g, Q>(
+        &'g mut self,
+        search_key: &Key<Q>,
+        guard: &'g Guard,
+    ) -> *mut LeafNode<K, V>
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
@@ -1330,6 +1350,7 @@ impl<K: Ord, V> Drop for ArcLeafNode<K, V> {
 }
 
 unsafe impl<K: Ord, V> Send for ArcLeafNode<K, V> {}
+
 unsafe impl<K: Ord, V> Sync for ArcLeafNode<K, V> {}
 
 struct ArcInterimNode<K: Ord, V> {
@@ -1386,6 +1407,7 @@ impl<K: Ord, V> Drop for ArcInterimNode<K, V> {
 }
 
 unsafe impl<K: Ord, V> Send for ArcInterimNode<K, V> {}
+
 unsafe impl<K: Ord, V> Sync for ArcInterimNode<K, V> {}
 
 enum NodePointer<K: Ord, V> {
@@ -1403,6 +1425,7 @@ impl<K: Ord + Clone, V> Clone for NodePointer<K, V> {
 }
 
 unsafe impl<K: Ord, V> Send for NodePointer<K, V> {}
+
 unsafe impl<K: Ord, V> Sync for NodePointer<K, V> {}
 
 impl<K: Ord, V> NodePointer<K, V> {
