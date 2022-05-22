@@ -106,30 +106,6 @@ type LeafNode<K, V> = Node<K, V>;
 /// which keys greater than any other key in current interim node.
 type InterimNode<K, V> = Node<Key<K>, HeapPointer<NodePointer<K, V>>>;
 
-macro_rules! tree_mut {
-    ($s: ident) => {
-        unsafe { &mut *($s as *const BzTree<K, V> as *mut BzTree<K, V>) }
-    };
-}
-
-macro_rules! tree_ref {
-    ($s: ident) => {
-        unsafe { &*($s as *const BzTree<K, V>) }
-    };
-}
-
-macro_rules! node_ref {
-    ($node: expr) => {
-        unsafe { &*$node }
-    };
-}
-
-macro_rules! node_mut {
-    ($node: expr) => {
-        unsafe { &mut *$node }
-    };
-}
-
 impl<K, V> BzTree<K, V>
 where
     K: Clone + Ord,
@@ -169,10 +145,8 @@ where
         let mut value: V = value;
         let search_key = Key::new(key.clone());
         loop {
-            let node = tree_mut!(self)
-                .find_leaf_for_key(&search_key, true, guard)
-                .unwrap();
-            match node_mut!(node).insert(key.clone(), value, guard) {
+            let node = self.find_leaf_for_key(&search_key, true, guard).unwrap();
+            match node.insert(key.clone(), value, guard) {
                 Ok(_) => {
                     return true;
                 }
@@ -221,10 +195,8 @@ where
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = tree_mut!(self)
-                .find_leaf_for_key(&search_key, true, guard)
-                .unwrap();
-            match unsafe { node_mut!(node).upsert(key.clone(), value, guard) } {
+            let node = self.find_leaf_for_key(&search_key, true, guard).unwrap();
+            match node.upsert(key.clone(), value, guard) {
                 Ok(prev_val) => {
                     return prev_val;
                 }
@@ -275,7 +247,7 @@ where
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            if let Some(node) = tree_mut!(self).find_leaf_for_key(&search_key, false, guard) {
+            if let Some(node) = self.find_leaf_for_key(&search_key, false, guard) {
                 let len = unsafe { (*node).estimated_len(guard) };
                 match unsafe { (*node).delete(key.borrow(), guard) } {
                     Ok(val) => {
@@ -312,9 +284,8 @@ where
         Q: Clone + Ord,
     {
         let search_key = Key::new(key.clone());
-        tree_mut!(self)
-            .find_leaf_for_key(&search_key, false, guard)
-            .and_then(|node| node_ref!(node).get(key, guard).map(|(_, val, _, _)| val))
+        self.find_leaf_for_key(&search_key, false, guard)
+            .and_then(|node| node.get(key, guard).map(|(_, val, _, _)| val))
     }
 
     /// Create tree range scanner which will return values whose keys is in passed range.
@@ -435,13 +406,13 @@ where
     pub fn pop_first<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
         // TODO: optimize priority queue like APIs
         loop {
-            let key = if let Some((key, _)) = tree_ref!(self).iter(guard).next() {
+            let key = if let Some((key, _)) = self.iter(guard).next() {
                 key.clone()
             } else {
                 return None;
             };
 
-            if let Some(val) = tree_mut!(self).delete(&key, guard) {
+            if let Some(val) = self.delete(&key, guard) {
                 return Some((key, val));
             }
         }
@@ -466,40 +437,41 @@ where
     /// assert!(matches!(tree.pop_last(&guard), None));
     /// ```
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        let max_key = Key::pos_infinite();
-        loop {
-            let max_node = tree_mut!(self).find_leaf_for_key(&max_key, false, guard);
-            let node_status = node_ref!(max_node).status_word().read(guard);
-            if let Some(max_entry) = node_ref!(max_node).conditional_last_kv(node_status, guard) {
-                // It's enough to only validate status word of leaf node to ensure that we pop
-                // current max element. While pop in progress, other threads can change tree
-                // shape by merge and split.
-                // If node which currently contains min/max element is merged/split, we will
-                // detect such change by checking node's status word.
-                // Merging of parent node also can proceed without additional validation
-                // because merge of parent do not change ordering of leaf elements.
-                // Split of parent node have 2 cases:
-                // 1. split caused by overflow of other leaf node(e.g., not current min/max node).
-                // In this case min or max node still contain min/max value and can be used for
-                // pop operation.
-                // 2. split caused by overflow of current min/max node.
-                // This case covered by status word validation.
-                if node_mut!(max_node)
-                    .conditional_delete(node_status, max_entry.location, guard)
-                    .is_ok()
-                {
-                    return Some((max_entry.key.clone(), max_entry.value));
-                }
-            } else {
-                if self.root.read(guard).points_to(max_node) {
-                    // current max/min node is empty and it is the root of tree
-                    return None;
-                }
-                // node which should contain +Inf key currently is empty
-                // we should help to merge such node and try again
-                self.merge_recursive(&max_key, guard);
-            }
-        }
+        return None;
+        // let max_key = Key::pos_infinite();
+        // loop {
+        //     let max_node = tree_mut!(self).find_leaf_for_key(&max_key, false, guard);
+        //     let node_status = node_ref!(max_node).status_word().read(guard);
+        //     if let Some(max_entry) = node_ref!(max_node).conditional_last_kv(node_status, guard) {
+        //         // It's enough to only validate status word of leaf node to ensure that we pop
+        //         // current max element. While pop in progress, other threads can change tree
+        //         // shape by merge and split.
+        //         // If node which currently contains min/max element is merged/split, we will
+        //         // detect such change by checking node's status word.
+        //         // Merging of parent node also can proceed without additional validation
+        //         // because merge of parent do not change ordering of leaf elements.
+        //         // Split of parent node have 2 cases:
+        //         // 1. split caused by overflow of other leaf node(e.g., not current min/max node).
+        //         // In this case min or max node still contain min/max value and can be used for
+        //         // pop operation.
+        //         // 2. split caused by overflow of current min/max node.
+        //         // This case covered by status word validation.
+        //         if node_mut!(max_node)
+        //             .conditional_delete(node_status, max_entry.location, guard)
+        //             .is_ok()
+        //         {
+        //             return Some((max_entry.key.clone(), max_entry.value));
+        //         }
+        //     } else {
+        //         if self.root.read(guard).points_to(max_node) {
+        //             // current max/min node is empty and it is the root of tree
+        //             return None;
+        //         }
+        //         // node which should contain +Inf key currently is empty
+        //         // we should help to merge such node and try again
+        //         self.merge_recursive(&max_key, guard);
+        //     }
+        // }
     }
 
     /// Update or delete element with passed key using conditional logic.
@@ -543,21 +515,14 @@ where
     {
         let search_key = Key::new(key.clone());
         loop {
-            let node = tree_mut!(self).find_leaf_for_key(&search_key, false, guard);
+            let node = self.find_leaf_for_key(&search_key, false, guard);
             if node.is_none() {
                 return false;
             }
             let node = node.unwrap();
-            if let Some((found_key, val, status_word, value_index)) =
-                node_ref!(node).get(key, guard)
-            {
+            if let Some((found_key, val, status_word, value_index)) = node.get(key, guard) {
                 if let Some(new_val) = new_val((found_key, val)) {
-                    match node_mut!(node).conditional_upsert(
-                        found_key.clone(),
-                        new_val,
-                        status_word,
-                        guard,
-                    ) {
+                    match node.conditional_upsert(found_key.clone(), new_val, status_word, guard) {
                         Ok(_) => {
                             return true;
                         }
@@ -578,8 +543,8 @@ where
                         Err(InsertError::Retry(_)) | Err(InsertError::NodeFrozen(_)) => {}
                     };
                 } else {
-                    let len = node_ref!(node).estimated_len(guard);
-                    match node_mut!(node).conditional_delete(status_word, value_index, guard) {
+                    let len = node.estimated_len(guard);
+                    match node.conditional_delete(status_word, value_index, guard) {
                         Ok(_) => {
                             if self.should_merge(len - 1) {
                                 self.merge_recursive(&search_key, guard);
@@ -1378,19 +1343,17 @@ where
 
     /// Find leaf node which can contain passed key
     fn find_leaf_for_key<'g, Q>(
-        &'g mut self,
+        &'g self,
         search_key: &Key<Q>,
         create_if_not_exists: bool,
         guard: &'g Guard,
-    ) -> Option<*mut LeafNode<K, V>>
+    ) -> Option<&'g LeafNode<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
         self.find_path_to_key(search_key, create_if_not_exists, guard)
-            .map(|path| {
-                path.node_pointer.to_leaf_node() as *const LeafNode<K, V> as *mut LeafNode<K, V>
-            })
+            .map(|path| path.node_pointer.to_leaf_node())
     }
 }
 

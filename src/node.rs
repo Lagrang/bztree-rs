@@ -18,12 +18,6 @@ pub struct Node<K: Ord, V> {
     readonly: bool,
 }
 
-macro_rules! deref {
-    ($node: expr) => {
-        unsafe { &*($node as *const Node<K, V>) }
-    };
-}
-
 macro_rules! deref_mut {
     ($node: expr) => {
         unsafe { &mut *($node as *const Node<K, V> as *mut Node<K, V>) }
@@ -106,19 +100,12 @@ impl<K: Ord, V> Node<K, V> {
         }
     }
 
-    pub fn insert<'g>(
-        &'g mut self,
-        key: K,
-        value: V,
-        guard: &'g Guard,
-    ) -> Result<(), InsertError<V>>
+    pub fn insert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Result<(), InsertError<V>>
     where
         K: Ord,
         V: Send + Sync,
     {
-        debug_assert!(!self.readonly);
-        let node_ptr = self as *const Node<K, V>;
-        let cur_status = unsafe { (&*node_ptr).status_word.read(guard) };
+        let cur_status = self.status_word.read(guard);
         match self.insert_phase_one(key, value, false, cur_status, guard) {
             Ok(reserved_entry) => self
                 .insert_phase_two(reserved_entry, false, guard)
@@ -131,7 +118,7 @@ impl<K: Ord, V> Node<K, V> {
     /// ## Return:
     /// Previous value associated with key, if it exists.
     pub fn upsert<'g>(
-        &'g mut self,
+        &'g self,
         key: K,
         value: V,
         guard: &'g Guard,
@@ -141,8 +128,7 @@ impl<K: Ord, V> Node<K, V> {
         V: Send + Sync,
     {
         debug_assert!(!self.readonly);
-        let node_ptr = self as *const Node<K, V>;
-        let cur_status = unsafe { (&*node_ptr).status_word.read(guard) };
+        let cur_status = self.status_word.read(guard);
         match self.insert_phase_one(key, value, true, cur_status, guard) {
             Ok(reserved_entry) => self.insert_phase_two(reserved_entry, true, guard),
             Err(e) => Err(e),
@@ -153,7 +139,7 @@ impl<K: Ord, V> Node<K, V> {
     /// ## Return:
     /// Previous value associated with key, if it exists.
     pub fn conditional_upsert<'g>(
-        &'g mut self,
+        &'g self,
         key: K,
         value: V,
         cur_status: &StatusWord,
@@ -173,7 +159,7 @@ impl<K: Ord, V> Node<K, V> {
     /// Remove value associated with passed key.
     /// ## Return:
     /// Value associated with removed key
-    pub fn delete<'g, Q>(&'g mut self, key: &Q, guard: &'g Guard) -> Result<&'g V, DeleteError>
+    pub fn delete<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Result<&'g V, DeleteError>
     where
         K: Borrow<Q>,
         Q: Ord,
@@ -190,7 +176,7 @@ impl<K: Ord, V> Node<K, V> {
             .map_err(|_| DeleteError::KeyNotFound)?;
 
         let new_status = current_status.delete_entry();
-        let entry = &mut self.data_block[index];
+        let entry = &mut deref_mut!(self).data_block[index];
         let cur_metadata: Metadata = entry.metadata.read(guard).into();
         if !cur_metadata.is_visible() {
             return Err(DeleteError::Retry);
@@ -220,7 +206,7 @@ impl<K: Ord, V> Node<K, V> {
     /// ## Return:
     /// Value associated with removed key
     pub fn conditional_delete<'g, Q>(
-        &'g mut self,
+        &'g self,
         status_word: &StatusWord,
         kv_index: usize,
         guard: &'g Guard,
@@ -235,7 +221,7 @@ impl<K: Ord, V> Node<K, V> {
         }
 
         let new_status = status_word.delete_entry();
-        let entry = &mut self.data_block[kv_index];
+        let entry = &mut deref_mut!(self).data_block[kv_index];
         let cur_metadata: Metadata = entry.metadata.read(guard).into();
         if !cur_metadata.is_visible() {
             return Err(DeleteError::Retry);
@@ -856,7 +842,7 @@ impl<K: Ord, V> Node<K, V> {
     }
 
     fn insert_phase_one(
-        &mut self,
+        &self,
         key: K,
         value: V,
         is_upsert: bool,
@@ -904,7 +890,7 @@ impl<K: Ord, V> Node<K, V> {
     }
 
     fn insert_phase_two<'g>(
-        &'g mut self,
+        &'g self,
         mut new_entry: ReservedEntry<K, V>,
         is_upsert: bool,
         guard: &'g Guard,
@@ -934,13 +920,14 @@ impl<K: Ord, V> Node<K, V> {
         let reserved_metadata: Metadata = self.data_block[index].metadata.read(guard).into();
         debug_assert!(reserved_metadata.is_reserved());
 
+        let self_mut = deref_mut!(self);
         unsafe {
             // we should write KV entry before we will make it visible
-            self.data_block[index]
+            self_mut.data_block[index]
                 .key
                 .as_mut_ptr()
                 .write_volatile(new_entry.key);
-            self.data_block[index]
+            self_mut.data_block[index]
                 .value
                 .as_mut_ptr()
                 .write_volatile(new_entry.value);
@@ -952,7 +939,7 @@ impl<K: Ord, V> Node<K, V> {
                 // no one seen this KV yet, move out it from node
                 self.clear_reserved_entry(index, guard);
                 let value = unsafe {
-                    mem::replace(&mut self.data_block[index].value, MaybeUninit::uninit())
+                    mem::replace(&mut self_mut.data_block[index].value, MaybeUninit::uninit())
                         .assume_init()
                 };
                 return Err(InsertError::NodeFrozen(value));
@@ -970,7 +957,7 @@ impl<K: Ord, V> Node<K, V> {
 
             if mwcas.exec(guard) {
                 return if let Some(index) = new_entry.existing_entry {
-                    let entry = &mut self.data_block[index];
+                    let entry = &mut self_mut.data_block[index];
                     let metadata: Metadata = entry.metadata.read(guard).into();
                     if metadata.is_visible() {
                         unsafe {
