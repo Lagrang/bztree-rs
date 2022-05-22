@@ -437,41 +437,40 @@ where
     /// assert!(matches!(tree.pop_last(&guard), None));
     /// ```
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        return None;
-        // let max_key = Key::pos_infinite();
-        // loop {
-        //     let max_node = tree_mut!(self).find_leaf_for_key(&max_key, false, guard);
-        //     let node_status = node_ref!(max_node).status_word().read(guard);
-        //     if let Some(max_entry) = node_ref!(max_node).conditional_last_kv(node_status, guard) {
-        //         // It's enough to only validate status word of leaf node to ensure that we pop
-        //         // current max element. While pop in progress, other threads can change tree
-        //         // shape by merge and split.
-        //         // If node which currently contains min/max element is merged/split, we will
-        //         // detect such change by checking node's status word.
-        //         // Merging of parent node also can proceed without additional validation
-        //         // because merge of parent do not change ordering of leaf elements.
-        //         // Split of parent node have 2 cases:
-        //         // 1. split caused by overflow of other leaf node(e.g., not current min/max node).
-        //         // In this case min or max node still contain min/max value and can be used for
-        //         // pop operation.
-        //         // 2. split caused by overflow of current min/max node.
-        //         // This case covered by status word validation.
-        //         if node_mut!(max_node)
-        //             .conditional_delete(node_status, max_entry.location, guard)
-        //             .is_ok()
-        //         {
-        //             return Some((max_entry.key.clone(), max_entry.value));
-        //         }
-        //     } else {
-        //         if self.root.read(guard).points_to(max_node) {
-        //             // current max/min node is empty and it is the root of tree
-        //             return None;
-        //         }
-        //         // node which should contain +Inf key currently is empty
-        //         // we should help to merge such node and try again
-        //         self.merge_recursive(&max_key, guard);
-        //     }
-        // }
+        let max_key = Key::pos_infinite();
+        loop {
+            let max_node = self.find_leaf_for_key(&max_key, false, guard);
+            let node_status = max_node.status_word().read(guard);
+            if let Some(max_entry) = max_node.conditional_last_kv(node_status, guard) {
+                // It's enough to only validate status word of leaf node to ensure that we pop
+                // current max element. While pop in progress, other threads can change tree
+                // shape by merge and split.
+                // If node which currently contains min/max element is merged/split, we will
+                // detect such change by checking node's status word.
+                // Merging of parent node also can proceed without additional validation
+                // because merge of parent do not change ordering of leaf elements.
+                // Split of parent node have 2 cases:
+                // 1. split caused by overflow of other leaf node(e.g., not current min/max node).
+                // In this case min or max node still contain min/max value and can be used for
+                // pop operation.
+                // 2. split caused by overflow of current min/max node.
+                // This case covered by status word validation.
+                if max_node
+                    .conditional_delete(node_status, max_entry.location, guard)
+                    .is_ok()
+                {
+                    return Some((max_entry.key.clone(), max_entry.value));
+                }
+            } else {
+                if self.root.read(guard).points_to(max_node) {
+                    // current max/min node is empty and it is the root of tree
+                    return None;
+                }
+                // node which should contain +Inf key currently is empty
+                // we should help to merge such node and try again
+                self.merge_recursive(&max_key, guard);
+            }
+        }
     }
 
     /// Update or delete element with passed key using conditional logic.
@@ -519,8 +518,10 @@ where
             if node.is_none() {
                 return false;
             }
+
             let node = node.unwrap();
             if let Some((found_key, val, status_word, value_index)) = node.get(key, guard) {
+                // compute new value for key
                 if let Some(new_val) = new_val((found_key, val)) {
                     match node.conditional_upsert(found_key.clone(), new_val, status_word, guard) {
                         Ok(_) => {
@@ -543,6 +544,7 @@ where
                         Err(InsertError::Retry(_)) | Err(InsertError::NodeFrozen(_)) => {}
                     };
                 } else {
+                    // no new value exists for key, caller want to remove KV
                     let len = node.estimated_len(guard);
                     match node.conditional_delete(status_word, value_index, guard) {
                         Ok(_) => {
@@ -1230,6 +1232,7 @@ where
                     if let Some((child_node_key, child_node_ptr)) =
                         node.closest_mut(search_key, guard)
                     {
+                        // found node which can contain the key
                         parents.push(Parent {
                             cas_pointer: next_node,
                             node_pointer,
@@ -1237,42 +1240,27 @@ where
                         });
                         child_node_ptr
                     } else if create_pos_inf_node_if_not_exists {
-                        if node.estimated_len(guard) == 0 {
-                            // current interim is empty, help with merge
-                            self.remove_empty_parent(
-                                TraversePath {
-                                    cas_pointer: next_node,
-                                    node_pointer,
-                                    parents,
-                                },
-                                vec![],
-                                guard,
-                            );
-                            // restart search from root
+                        // No place found for the key, we need to grow the tree.
+                        // Greatest element of interim node will serve as +Inf node to
+                        // accommodate new KV.
+                        if self.insert_pos_inf_node(
+                            next_node,
+                            node_pointer,
+                            node,
+                            parents.last(),
+                            guard,
+                        ) {
+                            // current interim was replaced in parent node, restart from it
+                            parents
+                                // TODO: here we had last() instead of pop(), no tests found the bug
+                                .pop()
+                                .map(|n| n.cas_pointer)
+                                .map_or_else(|| &self.root, |n| n)
+                        } else {
+                            // can't replace interim node, someone already change tree shape,
+                            // restart from root
                             parents = Vec::new();
                             &self.root
-                        } else {
-                            // no place found for key, we need to grow the tree
-                            // greatest element of interim node will serve as +Inf node to
-                            // accommodate new KVs
-                            if self.insert_pos_inf_node(
-                                next_node,
-                                node_pointer,
-                                node,
-                                parents.last(),
-                                guard,
-                            ) {
-                                // current interim was replaced in parent node, restart from it
-                                parents
-                                    .last()
-                                    .map(|n| n.cas_pointer)
-                                    .map_or_else(|| &self.root, |n| n)
-                            } else {
-                                // can't replace interim node, someone already change tree shape,
-                                // restart from root
-                                parents = Vec::new();
-                                &self.root
-                            }
                         }
                     } else {
                         return None;

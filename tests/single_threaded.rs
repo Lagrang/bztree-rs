@@ -62,6 +62,10 @@ fn fill(tree: &BzTree<Key<usize>, String>, size: usize) -> Vec<(Key<usize>, Stri
     expected_items
 }
 
+//TODO: add test which will fill the tree and then pop all elements
+//TODO: add test which will fill the tree and then remove all elements
+//TODO: add test which will mix all operations
+
 #[test]
 fn sequential_key_insert() {
     let node_size: usize = thread_rng().gen_range(50..100);
