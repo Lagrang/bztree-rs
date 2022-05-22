@@ -437,10 +437,14 @@ where
     /// assert!(matches!(tree.pop_last(&guard), None));
     /// ```
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        let max_key = Key::pos_infinite();
         loop {
-            let max_node = self.find_leaf_for_key(&max_key, false, guard);
+            let (max_node, key) = self.find_max_node(guard);
             let node_status = max_node.status_word().read(guard);
+            if node_status.is_frozen() {
+                // found node already removed from tree, restart
+                continue;
+            }
+
             if let Some(max_entry) = max_node.conditional_last_kv(node_status, guard) {
                 // It's enough to only validate status word of leaf node to ensure that we pop
                 // current max element. While pop in progress, other threads can change tree
@@ -455,20 +459,28 @@ where
                 // pop operation.
                 // 2. split caused by overflow of current min/max node.
                 // This case covered by status word validation.
-                if max_node
-                    .conditional_delete(node_status, max_entry.location, guard)
-                    .is_ok()
-                {
-                    return Some((max_entry.key.clone(), max_entry.value));
+                let len = max_node.estimated_len(guard);
+                match max_node.conditional_delete(node_status, max_entry.location, guard) {
+                    Ok(_) => {
+                        if self.should_merge(len - 1) {
+                            if let Some(k) = key {
+                                self.merge_recursive(k, guard);
+                            }
+                        }
+                        return Some((max_entry.key.clone(), max_entry.value));
+                    }
+                    Err(DeleteError::Retry) | Err(DeleteError::KeyNotFound) => {}
                 }
             } else {
-                if self.root.read(guard).points_to(max_node) {
+                if self.root.read(guard).points_to_leaf(max_node) {
                     // current max/min node is empty and it is the root of tree
                     return None;
                 }
-                // node which should contain +Inf key currently is empty
+                // node with max possible key is empty,
                 // we should help to merge such node and try again
-                self.merge_recursive(&max_key, guard);
+                if let Some(k) = key {
+                    self.merge_recursive(k, guard);
+                }
             }
         }
     }
@@ -1211,7 +1223,7 @@ where
         }
     }
 
-    /// Find node(with traversal path from root) which can contain passed key.
+    /// Find leaf node(with traversal path from root) which can contain passed key.
     /// If no node exists which can contain passed key, it can be created using
     /// `create_pos_inf_node_if_not_exists` flag.
     fn find_path_to_key<'g, Q>(
@@ -1342,6 +1354,29 @@ where
     {
         self.find_path_to_key(search_key, create_if_not_exists, guard)
             .map(|path| path.node_pointer.to_leaf_node())
+    }
+
+    /// Return leaf node which contains max known key of the tree. Also return key in parent node
+    /// which points to this leaf(or `None` if this is root node).
+    fn find_max_node<'g, Q>(&'g self, guard: &'g Guard) -> (&'g LeafNode<K, V>, Option<&'g Key<K>>)
+    where
+        K: Borrow<Q>,
+        Q: Ord,
+    {
+        let mut next_node: (&HeapPointer<NodePointer<K, V>>, Option<&Key<K>>) = (&self.root, None);
+        loop {
+            next_node = match next_node.0.read(guard) {
+                Interim(node) => {
+                    let (key, child_node_ptr) = node
+                        .last_kv(guard)
+                        .expect("Tree never contains empty interim nodes");
+                    (child_node_ptr, Some(key))
+                }
+                Leaf(node) => {
+                    return (node, next_node.1);
+                }
+            }
+        }
     }
 }
 
@@ -1528,10 +1563,10 @@ impl<K: Ord, V> NodePointer<K, V> {
     }
 
     #[inline]
-    fn points_to(&self, node_ptr: *mut LeafNode<K, V>) -> bool {
+    fn points_to_leaf(&self, node_ptr: &LeafNode<K, V>) -> bool {
         match self {
             Interim(_) => false,
-            Leaf(node) => node.node == node_ptr,
+            Leaf(node) => ptr::eq(node.node, node_ptr),
         }
     }
 
