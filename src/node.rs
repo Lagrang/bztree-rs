@@ -18,6 +18,18 @@ pub struct Node<K: Ord, V> {
     readonly: bool,
 }
 
+macro_rules! deref {
+    ($node: expr) => {
+        unsafe { &*($node as *const Node<K, V>) }
+    };
+}
+
+macro_rules! deref_mut {
+    ($node: expr) => {
+        unsafe { &mut *($node as *const Node<K, V> as *mut Node<K, V>) }
+    };
+}
+
 impl<K: Ord, V> Node<K, V> {
     /// Create empty node which can hold up to `max_elements`.
     pub fn with_capacity(max_elements: u16) -> Self
@@ -270,7 +282,7 @@ impl<K: Ord, V> Node<K, V> {
     ///
     /// **Warning**: this method can be called only for **read-only** nodes, it ignores
     /// any updates made after node creation.
-    pub fn closest_mut<'g, Q>(&'g mut self, key: &Q, _: &'g Guard) -> Option<(&'g K, &'g mut V)>
+    pub fn closest_mut<'g, Q>(&'g self, key: &Q, _: &'g Guard) -> Option<(&'g K, &'g mut V)>
     where
         K: PartialOrd<Q>,
         V: Clone,
@@ -303,7 +315,7 @@ impl<K: Ord, V> Node<K, V> {
             );
 
         if index < self.sorted_len {
-            let entry = &mut self.data_block[index];
+            let entry = &mut deref_mut!(self).data_block[index];
             let value = unsafe { &mut *entry.value.as_mut_ptr() };
             let key = unsafe { entry.key() };
             Some((key, value))

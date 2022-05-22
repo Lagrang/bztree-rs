@@ -42,6 +42,7 @@ mod status_word;
 
 use crate::node::{DeleteError, InsertError, MergeMode, Node, SplitMode};
 use crate::scanner::Scanner;
+use crate::NodePointer::{Interim, Leaf};
 use crossbeam_epoch::Guard;
 use mwcas::{HeapPointer, MwCas};
 use status_word::StatusWord;
@@ -168,7 +169,9 @@ where
         let mut value: V = value;
         let search_key = Key::new(key.clone());
         loop {
-            let node = tree_mut!(self).find_leaf_for_key(&search_key, true, guard);
+            let node = tree_mut!(self)
+                .find_leaf_for_key(&search_key, true, guard)
+                .unwrap();
             match node_mut!(node).insert(key.clone(), value, guard) {
                 Ok(_) => {
                     return true;
@@ -177,11 +180,13 @@ where
                     value = val;
                     // try to find path to overflowed node
                     let leaf_ptr = node as *const LeafNode<K, V>;
-                    let path = self.find_path_to_key(&search_key, guard);
-                    if let NodePointer::Leaf(found_leaf) = path.node_pointer {
-                        // if overflowed node is not split/merged by other thread during insert
-                        if ptr::eq(leaf_ptr, found_leaf.deref()) {
-                            self.split_leaf(path, guard);
+                    let path = self.find_path_to_key(&search_key, false, guard);
+                    if let Some(path) = path {
+                        if let Leaf(found_leaf) = path.node_pointer {
+                            // if overflowed node is not split/merged by other thread during insert
+                            if ptr::eq(leaf_ptr, found_leaf.deref()) {
+                                self.split_leaf(path, guard);
+                            }
                         }
                     }
                 }
@@ -216,19 +221,23 @@ where
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = tree_mut!(self).find_leaf_for_key(&search_key, true, guard);
-            match unsafe { (*node).upsert(key.clone(), value, guard) } {
+            let node = tree_mut!(self)
+                .find_leaf_for_key(&search_key, true, guard)
+                .unwrap();
+            match unsafe { node_mut!(node).upsert(key.clone(), value, guard) } {
                 Ok(prev_val) => {
                     return prev_val;
                 }
                 Err(InsertError::Split(val)) => {
                     value = val;
                     // try to find path to overflowed node
-                    let path = self.find_path_to_key(&search_key, guard);
-                    if let NodePointer::Leaf(found_leaf) = path.node_pointer {
-                        // if overflowed node is not split/merged by other thread
-                        if ptr::eq(node, found_leaf.deref()) {
-                            self.split_leaf(path, guard);
+                    let path = self.find_path_to_key(&search_key, false, guard);
+                    if let Some(path) = path {
+                        if let Leaf(found_leaf) = path.node_pointer {
+                            // if overflowed node is not split/merged by other thread
+                            if ptr::eq(node, found_leaf.deref()) {
+                                self.split_leaf(path, guard);
+                            }
                         }
                     }
                 }
@@ -266,17 +275,20 @@ where
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = tree_mut!(self).find_leaf_for_key(&search_key, false, guard);
-            let len = unsafe { (*node).estimated_len(guard) };
-            match unsafe { (*node).delete(key.borrow(), guard) } {
-                Ok(val) => {
-                    if self.should_merge(len - 1) {
-                        self.merge_recursive(&search_key, guard);
+            if let Some(node) = tree_mut!(self).find_leaf_for_key(&search_key, false, guard) {
+                let len = unsafe { (*node).estimated_len(guard) };
+                match unsafe { (*node).delete(key.borrow(), guard) } {
+                    Ok(val) => {
+                        if self.should_merge(len - 1) {
+                            self.merge_recursive(&search_key, guard);
+                        }
+                        return Some(val);
                     }
-                    return Some(val);
+                    Err(DeleteError::KeyNotFound) => return None,
+                    Err(DeleteError::Retry) => {}
                 }
-                Err(DeleteError::KeyNotFound) => return None,
-                Err(DeleteError::Retry) => {}
+            } else {
+                return None;
             }
         }
     }
@@ -300,8 +312,9 @@ where
         Q: Clone + Ord,
     {
         let search_key = Key::new(key.clone());
-        let node = tree_mut!(self).find_leaf_for_key(&search_key, false, guard);
-        node_ref!(node).get(key, guard).map(|(_, val, _, _)| val)
+        tree_mut!(self)
+            .find_leaf_for_key(&search_key, false, guard)
+            .and_then(|node| node_ref!(node).get(key, guard).map(|(_, val, _, _)| val))
     }
 
     /// Create tree range scanner which will return values whose keys is in passed range.
@@ -331,8 +344,8 @@ where
         guard: &'g Guard,
     ) -> impl DoubleEndedIterator<Item = (&'g K, &'g V)> + 'g {
         return match self.root.read(guard) {
-            NodePointer::Leaf(root) => Scanner::from_leaf_root(root, key_range, guard),
-            NodePointer::Interim(root) => Scanner::from_non_leaf_root(root, key_range, guard),
+            Leaf(root) => Scanner::from_leaf_root(root, key_range, guard),
+            Interim(root) => Scanner::from_non_leaf_root(root, key_range, guard),
         };
     }
 
@@ -531,6 +544,10 @@ where
         let search_key = Key::new(key.clone());
         loop {
             let node = tree_mut!(self).find_leaf_for_key(&search_key, false, guard);
+            if node.is_none() {
+                return false;
+            }
+            let node = node.unwrap();
             if let Some((found_key, val, status_word, value_index)) =
                 node_ref!(node).get(key, guard)
             {
@@ -546,11 +563,12 @@ where
                         }
                         Err(InsertError::Split(_)) => {
                             // try to find path to overflowed node
-                            let path = self.find_path_to_key(&search_key, guard);
-                            if let NodePointer::Leaf(found_leaf) = path.node_pointer {
-                                // if overflowed node is not split/merged by other thread
-                                if ptr::eq(node, found_leaf.deref()) {
-                                    self.split_leaf(path, guard);
+                            if let Some(path) = self.find_path_to_key(&search_key, false, guard) {
+                                if let Leaf(found_leaf) = path.node_pointer {
+                                    // if overflowed node is not split/merged by other thread
+                                    if ptr::eq(node, found_leaf.deref()) {
+                                        self.split_leaf(path, guard);
+                                    }
                                 }
                             }
                         }
@@ -589,17 +607,19 @@ where
         Q: Ord + Clone,
     {
         loop {
-            let path = self.find_path_to_key(key, guard);
-            match self.merge_node(path, guard) {
-                MergeResult::Completed => break,
-                MergeResult::Retry => {}
-                MergeResult::RecursiveMerge(path) => {
-                    // repeat until we try recursively merge parent nodes(until we find root
-                    // or some parent cannot be merged).
-                    let mut merge_path = path;
-                    while let MergeResult::RecursiveMerge(path) = self.merge_node(merge_path, guard)
-                    {
-                        merge_path = path;
+            if let Some(path) = self.find_path_to_key(key, false, guard) {
+                match self.merge_node(path, guard) {
+                    MergeResult::Completed => break,
+                    MergeResult::Retry => {}
+                    MergeResult::RecursiveMerge(path) => {
+                        // repeat until we try recursively merge parent nodes(until we find root
+                        // or some parent cannot be merged).
+                        let mut merge_path = path;
+                        while let MergeResult::RecursiveMerge(path) =
+                            self.merge_node(merge_path, guard)
+                        {
+                            merge_path = path;
+                        }
                     }
                 }
             }
@@ -632,7 +652,7 @@ where
         let mut unfroze_on_fail = vec![path.node_pointer.clone()];
 
         match path.node_pointer {
-            NodePointer::Leaf(node) => {
+            Leaf(node) => {
                 // merge is not required anymore, node received new KVs
                 // while we tried to merge it
                 if !self.should_merge(node.estimated_len(guard)) {
@@ -640,7 +660,7 @@ where
                     return MergeResult::Completed;
                 }
             }
-            NodePointer::Interim(_) => {
+            Interim(_) => {
                 // this is explicit request to merge interim node,
                 // always proceed with merge
             }
@@ -835,7 +855,7 @@ where
     fn merge_root(&self, root_ptr: &NodePointer<K, V>, guard: &Guard) -> MergeResult<K, V> {
         let mut cur_root = root_ptr;
         loop {
-            if let NodePointer::Interim(root) = cur_root {
+            if let Interim(root) = cur_root {
                 let root_status = root.status_word().read(guard);
                 // if root contains only 1 node, move this node up to root level
                 if !root_status.is_frozen() && root.estimated_len(guard) == 1 {
@@ -888,28 +908,26 @@ where
 
             // try merge node with sibling
             match node {
-                NodePointer::Leaf(node) => match sibling {
-                    NodePointer::Leaf(other) => {
-                        match node.merge_with_leaf(other, self.node_size, guard) {
-                            MergeMode::NewNode(merged_node) => {
-                                let node_key = std::cmp::max(&parent.child_key, sibling_key);
-                                let node_ptr = NodePointer::new_leaf(merged_node);
-                                merged = Some((node_key, node_ptr));
-                                merged_siblings.push(sibling_key);
-                                unfroze_on_fail.push((*sibling).clone());
-                                break;
-                            }
-                            MergeMode::MergeFailed => {
-                                sibling.try_unfroze();
-                            }
+                Leaf(node) => match sibling {
+                    Leaf(other) => match node.merge_with_leaf(other, self.node_size, guard) {
+                        MergeMode::NewNode(merged_node) => {
+                            let node_key = std::cmp::max(&parent.child_key, sibling_key);
+                            let node_ptr = NodePointer::new_leaf(merged_node);
+                            merged = Some((node_key, node_ptr));
+                            merged_siblings.push(sibling_key);
+                            unfroze_on_fail.push((*sibling).clone());
+                            break;
                         }
-                    }
-                    NodePointer::Interim(_) => {
+                        MergeMode::MergeFailed => {
+                            sibling.try_unfroze();
+                        }
+                    },
+                    Interim(_) => {
                         panic!("Can't merge leaf with interim node")
                     }
                 },
-                NodePointer::Interim(node) => match sibling {
-                    NodePointer::Interim(other) => {
+                Interim(node) => match sibling {
+                    Interim(other) => {
                         match node.merge_with_interim(
                             other,
                             node.estimated_len(guard) + other.estimated_len(guard),
@@ -928,7 +946,7 @@ where
                             }
                         }
                     }
-                    NodePointer::Leaf(_) => panic!("Can't merge interim node with leaf node"),
+                    Leaf(_) => panic!("Can't merge interim node with leaf node"),
                 },
             }
         }
@@ -1066,7 +1084,7 @@ where
         debug_assert!(root_status.is_frozen());
 
         let new_root = match root {
-            NodePointer::Leaf(cur_root) => {
+            Leaf(cur_root) => {
                 match cur_root.split_leaf(guard) {
                     SplitMode::Split(left, right) => {
                         // greatest key of left node moved to parent as split point
@@ -1096,7 +1114,7 @@ where
                     SplitMode::Compact(compacted_root) => NodePointer::new_leaf(compacted_root),
                 }
             }
-            NodePointer::Interim(cur_root) => {
+            Interim(cur_root) => {
                 match cur_root.split_interim(guard) {
                     SplitMode::Split(left, right) => {
                         let left_key = left
@@ -1173,7 +1191,7 @@ where
         }
 
         match node {
-            NodePointer::Leaf(leaf) => match leaf.split_leaf(guard) {
+            Leaf(leaf) => match leaf.split_leaf(guard) {
                 SplitMode::Split(left, right) => {
                     let left_key = left
                         .last_kv(guard)
@@ -1198,7 +1216,7 @@ where
                     SplitResult::Compacted(NodePointer::new_leaf(compacted_node))
                 }
             },
-            NodePointer::Interim(interim) => match interim.split_interim(guard) {
+            Interim(interim) => match interim.split_interim(guard) {
                 SplitMode::Split(left, right) => {
                     let left_key = left
                         .last_kv(guard)
@@ -1226,12 +1244,15 @@ where
         }
     }
 
-    /// Find node(with traversal path from root) which can contain passed key
+    /// Find node(with traversal path from root) which can contain passed key.
+    /// If no node exists which can contain passed key, it can be created using
+    /// `create_pos_inf_node_if_not_exists` flag.
     fn find_path_to_key<'g, Q>(
         &'g self,
         search_key: &Key<Q>,
+        create_pos_inf_node_if_not_exists: bool,
         guard: &'g Guard,
-    ) -> TraversePath<'g, K, V>
+    ) -> Option<TraversePath<'g, K, V>>
     where
         K: Borrow<Q>,
         Q: Ord,
@@ -1240,26 +1261,118 @@ where
         let mut next_node: &HeapPointer<NodePointer<K, V>> = &self.root;
         loop {
             next_node = match next_node.read(guard) {
-                parent_pointer @ NodePointer::Interim(_) => {
-                    let (child_node_key, child_node_ptr) = parent_pointer
-                        .to_interim_node()
-                        .closest(search_key, guard)
-                        .expect("+Inf node should always exists in tree");
-                    parents.push(Parent {
-                        cas_pointer: next_node,
-                        node_pointer: parent_pointer,
-                        child_key: child_node_key.clone(),
-                    });
-                    child_node_ptr
+                node_pointer @ Interim(node) => {
+                    if let Some((child_node_key, child_node_ptr)) =
+                        node.closest_mut(search_key, guard)
+                    {
+                        parents.push(Parent {
+                            cas_pointer: next_node,
+                            node_pointer,
+                            child_key: child_node_key.clone(),
+                        });
+                        child_node_ptr
+                    } else if create_pos_inf_node_if_not_exists {
+                        if node.estimated_len(guard) == 0 {
+                            // current interim is empty, help with merge
+                            self.remove_empty_parent(
+                                TraversePath {
+                                    cas_pointer: next_node,
+                                    node_pointer,
+                                    parents,
+                                },
+                                vec![],
+                                guard,
+                            );
+                            // restart search from root
+                            parents = Vec::new();
+                            &self.root
+                        } else {
+                            // no place found for key, we need to grow the tree
+                            // greatest element of interim node will serve as +Inf node to
+                            // accommodate new KVs
+                            if self.insert_pos_inf_node(
+                                next_node,
+                                node_pointer,
+                                node,
+                                parents.last(),
+                                guard,
+                            ) {
+                                // current interim was replaced in parent node, restart from it
+                                parents
+                                    .last()
+                                    .map(|n| n.cas_pointer)
+                                    .map_or_else(|| &self.root, |n| n)
+                            } else {
+                                // can't replace interim node, someone already change tree shape,
+                                // restart from root
+                                parents = Vec::new();
+                                &self.root
+                            }
+                        }
+                    } else {
+                        return None;
+                    }
                 }
-                leaf_pointer @ NodePointer::Leaf(_) => {
-                    return TraversePath {
+                leaf_pointer @ Leaf(_) => {
+                    return Some(TraversePath {
                         cas_pointer: next_node,
                         node_pointer: leaf_pointer,
                         parents,
-                    };
+                    });
                 }
             }
+        }
+    }
+
+    /// When interim node doesn't contains +Inf node and client tries to insert key which is
+    /// greater than any other key in the tree, we should update interim's node which
+    /// contains link to leaf with greatest element. This update will replace key of greatest
+    /// element in interim node by +Inf key. This updated interim can now accept new keys which
+    /// are greater than other keys of the tree.
+    fn insert_pos_inf_node<'g>(
+        &'g self,
+        next_node: &HeapPointer<NodePointer<K, V>>,
+        node_pointer: &NodePointer<K, V>,
+        node: &ArcInterimNode<K, V>,
+        parent_opt: Option<&Parent<K, V>>,
+        guard: &'g Guard,
+    ) -> bool {
+        if !node.try_froze(guard) {
+            // someone already froze this interim node, restart search from root
+            return false;
+        }
+
+        let mut elems: Vec<(Key<K>, HeapPointer<NodePointer<K, V>>)> = node
+            .iter(guard)
+            .map(|(key, val)| (key.clone(), val.clone()))
+            .collect();
+        elems.last_mut().unwrap().0 = Key::pos_infinite();
+        let new_interim = InterimNode::new_readonly(elems);
+        let mut mwcas = MwCas::new();
+        if let Some(parent) = parent_opt {
+            let status = parent.node().status_word().read(guard);
+            // check that parent not is not frozen during update one of
+            // it's children
+            if !status.is_frozen() {
+                mwcas.compare_exchange(parent.node().status_word(), status, status.clone());
+            } else {
+                // someone already froze this interim node, restart search from root
+                node.try_unfroze(guard);
+                return false;
+            }
+        }
+
+        // update link in parent node to new interim node
+        mwcas.compare_exchange(
+            next_node,
+            node_pointer,
+            NodePointer::new_interim(new_interim),
+        );
+        if !mwcas.exec(guard) {
+            node.try_unfroze(guard);
+            false
+        } else {
+            true
         }
     }
 
@@ -1269,43 +1382,15 @@ where
         search_key: &Key<Q>,
         create_if_not_exists: bool,
         guard: &'g Guard,
-    ) -> *mut LeafNode<K, V>
+    ) -> Option<*mut LeafNode<K, V>>
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
-        let mut parent: Option<&mut NodePointer<K, V>> = None;
-        let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
-        loop {
-            next_node = match next_node {
-                NodePointer::Interim(node) => {
-                    let node_ptr = node as *const ArcInterimNode<K, V>;
-                    if let Some((_, child_node)) = node.closest_mut(search_key, guard) {
-                        child_node.read_mut(guard)
-                    } else if create_if_not_exists {
-                        let mut elems: Vec<(Key<K>, HeapPointer<NodePointer<K, V>>)> =
-                            node_ref!(node_ptr)
-                                .iter(guard)
-                                .map(|(key, val)| (key.clone(), val.clone()))
-                                .collect();
-                        if elems.is_empty() {
-                            // current interim is empty, help with merge
-                            self.remove_empty_parent();
-                        } else {
-                            // existing greatest node now will serve as +Inf node
-                            elems.last_mut().unwrap().0 = Key::pos_infinite();
-                        }
-                        return ptr::null_mut();
-                    } else {
-                        return ptr::null_mut();
-                    }
-                }
-                NodePointer::Leaf(node_ref) => {
-                    return node_ref.deref_mut() as *mut LeafNode<K, V>;
-                }
-            };
-            parent = Some(next_node);
-        }
+        self.find_path_to_key(search_key, create_if_not_exists, guard)
+            .map(|path| {
+                path.node_pointer.to_leaf_node() as *const LeafNode<K, V> as *mut LeafNode<K, V>
+            })
     }
 }
 
@@ -1462,8 +1547,8 @@ enum NodePointer<K: Ord, V> {
 impl<K: Ord, V> Clone for NodePointer<K, V> {
     fn clone(&self) -> Self {
         match self {
-            NodePointer::Leaf(node) => NodePointer::Leaf(node.clone()),
-            NodePointer::Interim(node) => NodePointer::Interim(node.clone()),
+            Leaf(node) => Leaf(node.clone()),
+            Interim(node) => Interim(node.clone()),
         }
     }
 }
@@ -1474,7 +1559,7 @@ unsafe impl<K: Ord, V> Sync for NodePointer<K, V> {}
 
 impl<K: Ord, V> From<ArcInterimNode<K, V>> for NodePointer<K, V> {
     fn from(node: ArcInterimNode<K, V>) -> Self {
-        NodePointer::Interim(node)
+        Interim(node)
     }
 }
 
@@ -1482,28 +1567,44 @@ impl<K: Ord, V> NodePointer<K, V> {
     #[inline]
     fn new_leaf(node: LeafNode<K, V>) -> NodePointer<K, V> {
         let leaf_node = ArcLeafNode::new(node);
-        NodePointer::Leaf(leaf_node)
+        Leaf(leaf_node)
     }
 
     #[inline]
     fn new_interim(node: InterimNode<K, V>) -> NodePointer<K, V> {
         let interim_node = ArcInterimNode::new(node);
-        NodePointer::Interim(interim_node)
+        Interim(interim_node)
     }
 
     #[inline]
     fn points_to(&self, node_ptr: *mut LeafNode<K, V>) -> bool {
         match self {
-            NodePointer::Interim(_) => false,
-            NodePointer::Leaf(node) => node.node == node_ptr,
+            Interim(_) => false,
+            Leaf(node) => node.node == node_ptr,
         }
     }
 
     #[inline]
     fn to_interim_node(&self) -> &InterimNode<K, V> {
         match self {
-            NodePointer::Interim(node) => node,
-            NodePointer::Leaf(_) => panic!("Pointer points to leaf node"),
+            Interim(node) => node,
+            Leaf(_) => panic!("Pointer points to leaf node"),
+        }
+    }
+
+    #[inline]
+    fn to_leaf_node(&self) -> &LeafNode<K, V> {
+        match self {
+            Interim(_) => panic!("Pointer points to interim node"),
+            Leaf(node) => node,
+        }
+    }
+
+    #[inline]
+    fn is_leaf_node(&self) -> bool {
+        match self {
+            Interim(_) => false,
+            Leaf(_) => true,
         }
     }
 
@@ -1513,8 +1614,8 @@ impl<K: Ord, V> NodePointer<K, V> {
         K: Ord,
     {
         match self {
-            NodePointer::Leaf(node) => node.exact_len(guard),
-            NodePointer::Interim(node) => node.estimated_len(guard),
+            Leaf(node) => node.exact_len(guard),
+            Interim(node) => node.estimated_len(guard),
         }
     }
 
@@ -1522,8 +1623,8 @@ impl<K: Ord, V> NodePointer<K, V> {
     fn try_froze(&self) -> bool {
         let guard = crossbeam_epoch::pin();
         match self {
-            NodePointer::Leaf(node) => node.try_froze(&guard),
-            NodePointer::Interim(node) => node.try_froze(&guard),
+            Leaf(node) => node.try_froze(&guard),
+            Interim(node) => node.try_froze(&guard),
         }
     }
 
@@ -1531,16 +1632,16 @@ impl<K: Ord, V> NodePointer<K, V> {
     fn try_unfroze(&self) -> bool {
         let guard = crossbeam_epoch::pin();
         match self {
-            NodePointer::Leaf(node) => node.try_unfroze(&guard),
-            NodePointer::Interim(node) => node.try_unfroze(&guard),
+            Leaf(node) => node.try_unfroze(&guard),
+            Interim(node) => node.try_unfroze(&guard),
         }
     }
 
     #[inline]
     fn status_word(&self) -> &HeapPointer<StatusWord> {
         match self {
-            NodePointer::Leaf(node) => node.status_word(),
-            NodePointer::Interim(node) => node.status_word(),
+            Leaf(node) => node.status_word(),
+            Interim(node) => node.status_word(),
         }
     }
 }

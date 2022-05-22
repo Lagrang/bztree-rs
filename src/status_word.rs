@@ -8,6 +8,10 @@ pub struct StatusWord {
 }
 
 impl StatusWord {
+    // TODO: add node version to remove code which froze interim nodes during merge/split
+    // this required to ensure that node not changed while we iterate over it. Currently this
+    // requires unconditional froze of interim node. Version field can solve this problem and
+    // allow more optimistic concurrency.
     const FROZEN_MASK: u64 = 0x1000_0000_0000_0000;
     const DELETE_SIZE_MASK: u64 = 0x0000_0000_0000_FFFF;
     const RESERVED_RECORD_COUNT_MASK: u64 = 0x0000_0000_FFFF_0000;
