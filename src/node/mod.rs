@@ -171,17 +171,17 @@ impl<K: Ord, V> Node<K, V> {
         Q: Ord,
     {
         debug_assert!(!self.readonly);
-        let current_status = self.status_word.read(guard);
-        if current_status.is_frozen() {
+        let status_word = self.status_word.read(guard);
+        if status_word.is_frozen() {
             return Err(DeleteError::Retry);
         }
 
         let index = self
-            .get_internal(key, current_status, true, guard)
+            .get_internal(key, status_word, true, guard)
             .map(|(_, _, kv_index)| kv_index)
             .map_err(|_| DeleteError::KeyNotFound)?;
 
-        let new_status = current_status.delete_entry();
+        let new_status = status_word.delete_entry();
         let entry = &mut deref_mut!(self).data_block[index];
         let cur_metadata: Metadata = entry.metadata.read(guard).into();
         if !cur_metadata.is_visible() {
@@ -189,7 +189,7 @@ impl<K: Ord, V> Node<K, V> {
         }
 
         let mut mwcas = MwCas::new();
-        mwcas.compare_exchange(&self.status_word, current_status, new_status);
+        mwcas.compare_exchange(&self.status_word, status_word, new_status);
         mwcas.compare_exchange_u64(
             &entry.metadata,
             cur_metadata.into(),
@@ -416,15 +416,18 @@ impl<K: Ord, V> Node<K, V> {
         self.range(.., guard)
     }
 
-    pub fn conditional_last_kv<'g>(
-        &'g self,
-        status_word: &StatusWord,
-        guard: &'g Guard,
-    ) -> Option<EntryWithLoc<'g, K, V>>
+    /// Find KV which placed on some of node's edge(e.g. min KV or max KV).
+    pub fn edge_kv<'g>(&'g self, edge: NodeEdge, guard: &'g Guard) -> Option<EntryWithLoc<'g, K, V>>
     where
         K: Ord,
     {
-        let mut unsorted_max: Option<EntryWithLoc<K, V>> = None;
+        let status_word = self.status_word().read(guard);
+        let expected_ord = match edge {
+            NodeEdge::Left => Ordering::Less,
+            NodeEdge::Right => Ordering::Greater,
+        };
+
+        let mut unsorted_edge: Option<EntryWithLoc<K, V>> = None;
         if self.sorted_len < status_word.reserved_records() as usize {
             // scan unsorted part first because it contain most recent values
             for index in self.sorted_len..status_word.reserved_records() as usize {
@@ -438,9 +441,9 @@ impl<K: Ord, V> Node<K, V> {
 
                 if metadata.is_visible() {
                     let key = unsafe { entry.key() };
-                    unsorted_max = unsorted_max
+                    unsorted_edge = unsorted_edge
                         .map(|max| {
-                            if key > max.key {
+                            if key.cmp(max.key) == expected_ord {
                                 EntryWithLoc {
                                     location: index,
                                     key,
@@ -461,36 +464,55 @@ impl<K: Ord, V> Node<K, V> {
             }
         }
 
-        let sorted_max = self.data_block[..self.sorted_len]
-            .iter()
-            .rev()
-            .filter_map(|entry| {
-                let metadata: Metadata = entry.metadata.read(guard).into();
-                if metadata.is_visible() {
-                    Some(EntryWithLoc {
-                        key: unsafe { entry.key() },
-                        value: unsafe { entry.value() },
-                        location: self.sorted_len - 1,
-                    })
-                } else {
-                    None
-                }
-            })
-            .next();
+        let sorted_edge = match edge {
+            NodeEdge::Left => self.data_block[..self.sorted_len]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| {
+                    let metadata: Metadata = entry.metadata.read(guard).into();
+                    if metadata.is_visible() {
+                        Some(EntryWithLoc {
+                            key: unsafe { entry.key() },
+                            value: unsafe { entry.value() },
+                            location: i,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .next(),
+            NodeEdge::Right => self.data_block[..self.sorted_len]
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(i, entry)| {
+                    let metadata: Metadata = entry.metadata.read(guard).into();
+                    if metadata.is_visible() {
+                        Some(EntryWithLoc {
+                            key: unsafe { entry.key() },
+                            value: unsafe { entry.value() },
+                            location: i,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .next(),
+        };
 
-        if sorted_max.is_none() {
-            unsorted_max
-        } else if unsorted_max.is_none() {
-            sorted_max
+        if sorted_edge.is_none() {
+            unsorted_edge
+        } else if unsorted_edge.is_none() {
+            sorted_edge
         } else {
-            let sorted_max = sorted_max.unwrap();
-            let sorted_key = sorted_max.key;
-            let unsorted_max = unsorted_max.unwrap();
-            let unsorted_key = unsorted_max.key;
-            if sorted_key > unsorted_key {
-                Some(sorted_max)
+            let sorted_edge = sorted_edge.unwrap();
+            let sorted_key = sorted_edge.key;
+            let unsorted_edge = unsorted_edge.unwrap();
+            let unsorted_key = unsorted_edge.key;
+            if sorted_key.cmp(unsorted_key) == expected_ord {
+                Some(sorted_edge)
             } else {
-                Some(unsorted_max)
+                Some(unsorted_edge)
             }
         }
     }
@@ -499,74 +521,18 @@ impl<K: Ord, V> Node<K, V> {
     where
         K: Ord,
     {
-        let status_word = self.status_word().read(guard);
         return self
-            .conditional_last_kv(status_word, guard)
+            .edge_kv(NodeEdge::Right, guard)
             .map(|kv| (kv.key, kv.value));
-    }
-
-    pub fn conditional_first_kv<'g>(
-        &'g self,
-        status_word: &StatusWord,
-        guard: &'g Guard,
-    ) -> Option<(&'g K, &'g V)>
-    where
-        K: Ord,
-    {
-        let mut unsorted_min: Option<&Entry<K, V>> = None;
-        if self.sorted_len < status_word.reserved_records() as usize {
-            // scan unsorted part first because it contain most recent values
-            for index in self.sorted_len..status_word.reserved_records() as usize {
-                let entry = &self.data_block[index];
-                let metadata = loop {
-                    let metadata: Metadata = entry.metadata.read(guard).into();
-                    if !metadata.is_reserved() {
-                        break metadata;
-                    }
-                };
-
-                if metadata.is_visible() {
-                    let key = unsafe { entry.key() };
-                    unsorted_min = unsorted_min
-                        .map(|min_kv| {
-                            if key < unsafe { min_kv.key() } {
-                                entry
-                            } else {
-                                min_kv
-                            }
-                        })
-                        .or(Some(entry));
-                }
-            }
-        }
-
-        let sorted_min = self.data_block[..self.sorted_len].iter().find(|entry| {
-            let metadata: Metadata = entry.metadata.read(guard).into();
-            metadata.is_visible()
-        });
-
-        let min_kv = if sorted_min.is_none() {
-            unsorted_min
-        } else if unsorted_min.is_none() {
-            sorted_min
-        } else {
-            let sorted_key = unsafe { sorted_min.unwrap().key() };
-            let unsorted_key = unsafe { unsorted_min.unwrap().key() };
-            if sorted_key < unsorted_key {
-                sorted_min
-            } else {
-                unsorted_min
-            }
-        };
-        min_kv.map(|kv| unsafe { (kv.key(), kv.value()) })
     }
 
     pub fn first_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Ord,
     {
-        let status_word = self.status_word().read(guard);
-        self.conditional_first_kv(status_word, guard)
+        return self
+            .edge_kv(NodeEdge::Left, guard)
+            .map(|kv| (kv.key, kv.value));
     }
 
     pub fn split_leaf(&self, guard: &Guard) -> SplitMode<K, V>
@@ -1189,6 +1155,12 @@ pub enum DeleteError {
 pub enum SearchError {
     ReservedEntryFound,
     KeyNotFound,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum NodeEdge {
+    Left,
+    Right,
 }
 
 #[cfg(test)]

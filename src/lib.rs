@@ -39,7 +39,7 @@ extern crate core;
 mod node;
 mod scanner;
 
-use crate::node::{DeleteError, InsertError, MergeMode, Node, SplitMode};
+use crate::node::{DeleteError, InsertError, MergeMode, Node, NodeEdge, SplitMode};
 use crate::scanner::Scanner;
 use crate::NodePointer::{Interim, Leaf};
 use crossbeam_epoch::Guard;
@@ -404,18 +404,7 @@ where
     /// assert!(matches!(tree.pop_first(&guard), None));
     /// ```
     pub fn pop_first<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        // TODO: optimize priority queue like APIs
-        loop {
-            let key = if let Some((key, _)) = self.iter(guard).next() {
-                key.clone()
-            } else {
-                return None;
-            };
-
-            if let Some(val) = self.delete(&key, guard) {
-                return Some((key, val));
-            }
-        }
+        self.pop(NodeEdge::Left, guard)
     }
 
     /// Remove and return last element of tree according to key ordering.
@@ -437,15 +426,19 @@ where
     /// assert!(matches!(tree.pop_last(&guard), None));
     /// ```
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
+        self.pop(NodeEdge::Right, guard)
+    }
+
+    fn pop<'g>(&'g self, pop_from: NodeEdge, guard: &'g Guard) -> Option<(K, &'g V)> {
         loop {
-            let (max_node, key) = self.find_max_node(guard);
-            let node_status = max_node.status_word().read(guard);
+            let (edge_node, edge_key) = self.find_edge_node(pop_from, guard);
+            let node_status = edge_node.status_word().read(guard);
             if node_status.is_frozen() {
                 // found node already removed from tree, restart
                 continue;
             }
 
-            if let Some(max_entry) = max_node.conditional_last_kv(node_status, guard) {
+            if let Some(edge_entry) = edge_node.edge_kv(pop_from, guard) {
                 // It's enough to only validate status word of leaf node to ensure that we pop
                 // current max element. While pop in progress, other threads can change tree
                 // shape by merge and split.
@@ -459,26 +452,26 @@ where
                 // pop operation.
                 // 2. split caused by overflow of current min/max node.
                 // This case covered by status word validation.
-                let len = max_node.estimated_len(guard);
-                match max_node.conditional_delete(node_status, max_entry.location, guard) {
+                let len = edge_node.estimated_len(guard);
+                match edge_node.conditional_delete(node_status, edge_entry.location, guard) {
                     Ok(_) => {
                         if self.should_merge(len - 1) {
-                            if let Some(k) = key {
+                            if let Some(k) = edge_key {
                                 self.merge_recursive(k, guard);
                             }
                         }
-                        return Some((max_entry.key.clone(), max_entry.value));
+                        return Some((edge_entry.key.clone(), edge_entry.value));
                     }
                     Err(DeleteError::Retry) | Err(DeleteError::KeyNotFound) => {}
                 }
             } else {
-                if self.root.read(guard).points_to_leaf(max_node) {
+                if self.root.read(guard).points_to_leaf(edge_node) {
                     // current max/min node is empty and it is the root of tree
                     return None;
                 }
                 // node with max possible key is empty,
                 // we should help to merge such node and try again
-                if let Some(k) = key {
+                if let Some(k) = edge_key {
                     self.merge_recursive(k, guard);
                 }
             }
@@ -1358,7 +1351,11 @@ where
 
     /// Return leaf node which contains max known key of the tree. Also return key in parent node
     /// which points to this leaf(or `None` if this is root node).
-    fn find_max_node<'g, Q>(&'g self, guard: &'g Guard) -> (&'g LeafNode<K, V>, Option<&'g Key<K>>)
+    fn find_edge_node<'g, Q>(
+        &'g self,
+        node_edge: NodeEdge,
+        guard: &'g Guard,
+    ) -> (&'g LeafNode<K, V>, Option<&'g Key<K>>)
     where
         K: Borrow<Q>,
         Q: Ord,
@@ -1368,8 +1365,10 @@ where
             next_node = match next_node.0.read(guard) {
                 Interim(node) => {
                     let (key, child_node_ptr) = node
-                        .last_kv(guard)
+                        .edge_kv(node_edge, guard)
+                        .map(|e| (e.key, e.value))
                         .expect("Tree never contains empty interim nodes");
+
                     (child_node_ptr, Some(key))
                 }
                 Leaf(node) => {
@@ -2177,6 +2176,7 @@ mod tests {
         }
 
         for i in 0..count {
+            println!("{i}");
             assert!(matches!(tree.pop_first(&guard), Some((k, _)) if k == Key::new(i)));
         }
 
@@ -2193,8 +2193,7 @@ mod tests {
         }
 
         for i in (0..count).rev() {
-            let res = tree.pop_last(&guard);
-            assert!(matches!(res, Some((k, _)) if k == Key::new(i)));
+            assert!(matches!(tree.pop_last(&guard), Some((k, _)) if k == Key::new(i)));
         }
 
         assert!(tree.iter(&guard).next().is_none());
