@@ -177,7 +177,7 @@ impl<K: Ord, V> Node<K, V> {
         }
 
         let index = self
-            .get_internal(key, &current_status, true, guard)
+            .get_internal(key, current_status, true, guard)
             .map(|(_, _, kv_index)| kv_index)
             .map_err(|_| DeleteError::KeyNotFound)?;
 
@@ -629,8 +629,8 @@ impl<K: Ord, V> Node<K, V> {
         V: Clone,
     {
         debug_assert!(
-            self.status_word.read(guard).is_frozen() && other.status_word.read(guard).is_frozen(),
-            "Both nodes must be frozen before merge"
+            self.status_word.read(guard).is_frozen(),
+            "Node must be frozen before merge"
         );
 
         let mut p1 = self
@@ -684,8 +684,8 @@ impl<K: Ord, V> Node<K, V> {
         V: Clone + Send + Sync,
     {
         debug_assert!(
-            self.status_word.read(guard).is_frozen() && other.status_word.read(guard).is_frozen(),
-            "Both nodes must be frozen before merge"
+            self.status_word.read(guard).is_frozen(),
+            "Node must be frozen before merge"
         );
 
         let len = self.estimated_len(guard);
@@ -757,7 +757,7 @@ impl<K: Ord, V> Node<K, V> {
 
     #[inline]
     pub fn try_froze(&self, guard: &Guard) -> bool {
-        let cur_status = self.status_word.read(&guard);
+        let cur_status = self.status_word.read(guard);
         if cur_status.is_frozen() {
             return false;
         }

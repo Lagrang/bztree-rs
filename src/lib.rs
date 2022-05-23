@@ -618,24 +618,15 @@ where
 
         // freeze underflow node to ensure that no one can modify it
         if !path.node_pointer.try_froze() {
-            // can't froze node because it:
-            // - already merged/split
-            // - replaced by new one(in case of interim nodes)
-            // - temporary frozen by 'merge with sibling' method
             return MergeResult::Retry;
         }
-
-        // this vector will contain all nodes which are frozen during merge process
-        // if merge will fail for some reason, all these nodes should be unfrozen
-        // because they still present in the tree.
-        let mut unfroze_on_fail = vec![path.node_pointer.clone()];
 
         match path.node_pointer {
             Leaf(node) => {
                 // merge is not required anymore, node received new KVs
                 // while we tried to merge it
                 if !self.should_merge(node.estimated_len(guard)) {
-                    Self::unfroze(unfroze_on_fail);
+                    path.node_pointer.try_unfroze();
                     return MergeResult::Completed;
                 }
             }
@@ -645,24 +636,20 @@ where
             }
         };
 
+        // merging of underflow node with sibling will return 'new parent' node.
+        // This 'new parent' doesn't contain underutilized node and should be
+        // installed in grandparent node(by replacing 'current parent' node pointer with pointer
+        // to 'new parent' node).
         let parent = parent.unwrap();
-        // Parent node also should be frozen before merge, because we scan parent node KVs
-        // and copy them into new parent node. At the same time other thread can also
-        // merge other node and modify node pointers in our parent(other thread treat our
-        // parent as grandparent).
-        if !parent.node().try_froze(guard) {
-            Self::unfroze(unfroze_on_fail);
+        let parent_status = parent.node().status_word().read(guard);
+        if parent_status.is_frozen() {
+            path.node_pointer.try_unfroze();
             return MergeResult::Retry;
         }
-        unfroze_on_fail.push(parent.node_pointer.clone());
-
-        // start merging underflow node with sibling will return 'new parent' node.
-        // This 'new parent' doesn't contain underutilized node. This 'new parent' node should be
-        // installed in grandparent node by replacing 'current parent' node pointer with pointer
-        // to 'new parent' node.
 
         // if no siblings in parent node
         if parent.node().estimated_len(guard) <= 1 {
+            path.node_pointer.try_unfroze();
             return if path.node_pointer.len(guard) == 0 {
                 // underflow node is empty and parent doesn't contain any other nodes,
                 // we can remove empty parent node from the tree
@@ -672,14 +659,12 @@ where
                         node_pointer: parent.node_pointer,
                         cas_pointer: parent.cas_pointer,
                     },
-                    unfroze_on_fail,
                     guard,
                 )
             } else {
                 // underflow node cannot be merged with siblings, try to merge parent with it
                 // sibling on their level. This give a chance later to merge current underflow node
                 // with sibling node from another parent.
-                Self::unfroze(unfroze_on_fail);
                 MergeResult::RecursiveMerge(TraversePath {
                     cas_pointer: parent.cas_pointer,
                     node_pointer: parent.node_pointer,
@@ -688,16 +673,14 @@ where
             };
         }
 
+        let mut mwcas = MwCas::new();
         // merge underflow node with one of its siblings
-        let new_parent = match self.merge_with_sibling(
-            path.node_pointer,
-            &parent,
-            &mut unfroze_on_fail,
-            guard,
-        ) {
+        let merge_res =
+            self.merge_with_sibling(path.node_pointer, &parent, parent_status, &mut mwcas, guard);
+        let new_parent = match merge_res {
             Ok(new_parent) => new_parent,
             Err(e) => {
-                Self::unfroze(unfroze_on_fail);
+                path.node_pointer.try_unfroze();
                 return e;
             }
         };
@@ -705,7 +688,16 @@ where
         // check that parent node is also underflow and should be merged on it's own level
         let new_parent_should_merge = self.should_merge(new_parent.estimated_len(guard));
 
-        let mut mwcas = MwCas::new();
+        mwcas.compare_exchange(
+            parent.node().status_word(),
+            parent_status,
+            parent_status.froze(),
+        );
+        mwcas.compare_exchange(
+            parent.cas_pointer,
+            parent.node_pointer,
+            NodePointer::new_interim(new_parent),
+        );
         // if parent node has grandparent node, then check that grandparent not frozen.
         // if parent node has no grandparent node, then parent is current root, we can simply CAS
         // on root pointer.
@@ -715,28 +707,23 @@ where
                 // grandparent merged/split in progress, rollback changes and retry
                 // when parent node will be moved to new grandparent
                 // or this grandparent will be unfrozen
-                Self::unfroze(unfroze_on_fail);
+                path.node_pointer.try_unfroze();
                 return MergeResult::Retry;
             }
-
+            // check that grandparent is not frozen and increase it version
+            // (because we make in-place update of link to parent node)
             mwcas.compare_exchange(
                 grand_parent.node().status_word(),
                 status_word,
-                status_word.clone(),
+                status_word.inc_version(),
             );
         }
-        mwcas.compare_exchange(
-            parent.cas_pointer,
-            parent.node_pointer,
-            NodePointer::new_interim(new_parent),
-        );
 
         // merge prepared, try to install new nodes instead of underutilized
         if mwcas.exec(guard) {
             // we successfully merge node, now check is it parent become underutilized.
             // we try to merge parent only after original node merged, this will provide
             // bottom-up merge until we reach root.
-
             if new_parent_should_merge {
                 let new_parent_ptr = parent.cas_pointer.read(guard);
                 return MergeResult::RecursiveMerge(TraversePath {
@@ -747,7 +734,7 @@ where
             }
             MergeResult::Completed
         } else {
-            Self::unfroze(unfroze_on_fail);
+            path.node_pointer.try_unfroze();
             MergeResult::Retry
         }
     }
@@ -759,18 +746,26 @@ where
     /// new grandparent inside tree.
     fn remove_empty_parent(
         &self,
-        mut path_to_empty_node: TraversePath<K, V>,
-        mut unfroze_on_fail: Vec<NodePointer<K, V>>,
+        mut empty_node_path: TraversePath<K, V>,
         guard: &Guard,
     ) -> MergeResult<K, V> {
-        if let Some(parent_handle) = path_to_empty_node.parents.pop() {
+        let mut mwcas = MwCas::new();
+        let node_status = empty_node_path.node_pointer.status_word().read(guard);
+        if node_status.is_frozen() {
+            return MergeResult::Retry;
+        }
+        mwcas.compare_exchange(
+            empty_node_path.node_pointer.status_word(),
+            node_status,
+            node_status.froze(),
+        );
+
+        if let Some(parent_handle) = empty_node_path.parents.pop() {
             let parent_node = parent_handle.node_pointer.to_interim_node();
-            if !parent_node.try_froze(guard) {
-                Self::unfroze(unfroze_on_fail);
+            let parent_status = parent_node.status_word().read(guard);
+            if parent_status.is_frozen() {
                 return MergeResult::Retry;
             }
-            unfroze_on_fail.push(parent_handle.node_pointer.clone());
-
             // Parent node contains 1 node which should be removed because it empty.
             // We should recursively process this parent node because logically it empty. Then we
             // found some grandparent node which is not empty, we remove all empty nodes from it.
@@ -778,12 +773,34 @@ where
             if parent_node.estimated_len(guard) == 1 {
                 return self.remove_empty_parent(
                     TraversePath {
-                        parents: path_to_empty_node.parents,
+                        parents: empty_node_path.parents,
                         cas_pointer: parent_handle.cas_pointer,
                         node_pointer: parent_handle.node_pointer,
                     },
-                    unfroze_on_fail,
                     guard,
+                );
+            }
+
+            mwcas.compare_exchange(
+                parent_node.status_word(),
+                parent_status,
+                parent_status.froze(),
+            );
+
+            // if parent node has grandparent node, then check that grandparent not frozen.
+            if let Some(grand_parent) = empty_node_path.parents.last() {
+                let status_word = grand_parent.node().status_word().read(guard);
+                if status_word.is_frozen() {
+                    // grandparent merged/split in progress, rollback changes and retry
+                    // when parent node will be moved to new grandparent
+                    // or this grandparent will be unfrozen
+                    return MergeResult::Retry;
+                }
+
+                mwcas.compare_exchange(
+                    grand_parent.node().status_word(),
+                    status_word,
+                    status_word.inc_version(),
                 );
             }
 
@@ -800,34 +817,27 @@ where
                     })
                     .collect(),
             );
-            let mut mwcas = MwCas::new();
+
             mwcas.compare_exchange(
                 parent_handle.cas_pointer,
                 parent_handle.node_pointer,
                 NodePointer::new_interim(new_node),
             );
-            if mwcas.exec(guard) {
-                MergeResult::Completed
-            } else {
-                Self::unfroze(unfroze_on_fail);
-                MergeResult::Retry
-            }
         } else {
             // Parent node is root and it contains only 1 link to empty child node, replace root
             // node by empty leaf node. Parent node already frozen at this moment, simply replace
             // old parent by new root node.
-            let mut mwcas = MwCas::new();
             mwcas.compare_exchange(
-                path_to_empty_node.cas_pointer,
-                path_to_empty_node.node_pointer,
+                empty_node_path.cas_pointer,
+                empty_node_path.node_pointer,
                 NodePointer::new_leaf(LeafNode::with_capacity(self.node_size as u16)),
             );
-            if mwcas.exec(guard) {
-                MergeResult::Completed
-            } else {
-                Self::unfroze(unfroze_on_fail);
-                MergeResult::Retry
-            }
+        }
+
+        if mwcas.exec(guard) {
+            MergeResult::Completed
+        } else {
+            MergeResult::Retry
         }
     }
 
@@ -842,7 +852,7 @@ where
                     let child_node_pointer = child_ptr.read(guard);
                     let child_status = child_node_pointer.status_word().read(guard);
                     let mut mwcas = MwCas::new();
-                    mwcas.compare_exchange(&root.status_word(), root_status, root_status.froze());
+                    mwcas.compare_exchange(root.status_word(), root_status, root_status.froze());
                     mwcas.compare_exchange(
                         child_node_pointer.status_word(),
                         child_status,
@@ -865,24 +875,30 @@ where
         &self,
         node: &'g NodePointer<K, V>,
         parent: &'g Parent<'g, K, V>,
-        unfroze_on_fail: &mut Vec<NodePointer<K, V>>,
+        parent_status: &StatusWord,
+        mwcas: &mut MwCas<'g>,
         guard: &'g Guard,
     ) -> Result<InterimNode<K, V>, MergeResult<K, V>> {
-        let mut siblings: Vec<(Key<K>, &NodePointer<K, V>)> = Vec::with_capacity(2);
+        let mut siblings: Vec<(&Key<K>, &NodePointer<K, V>)> = Vec::with_capacity(2);
         let node_key = &parent.child_key;
         let sibling_array = parent.node().get_siblings(node_key, guard);
-        for i in 0..sibling_array.len() {
-            if let Some((key, sibling)) = sibling_array[i] {
-                siblings.push((key.clone(), sibling.read(guard)));
-            }
+        if parent.node().status_word().read(guard) != parent_status {
+            // parent changed, found siblings can be invalid, retry
+            return Err(MergeResult::Retry);
         }
 
-        let mut merged_siblings = Vec::with_capacity(2);
-        let mut merged = None;
+        for (key, sibling) in sibling_array.iter().flatten() {
+            siblings.push((key, sibling.read(guard)));
+        }
+
+        let mut merged_sibling_key: Option<&Key<K>> = None;
+        let mut merged: Option<(&Key<K>, NodePointer<K, V>)> = None;
         for (sibling_key, sibling) in &siblings {
-            if !sibling.try_froze() {
-                // sibling can be temporary frozen by merge attempt of other thread(which an fail)
-                continue;
+            let sibling_status = sibling.status_word().read(guard);
+            if sibling_status.is_frozen() {
+                // sibling is frozen by merge in other thread, retry merge again because parent
+                // already changed and current merge will fail.
+                return Err(MergeResult::Retry);
             }
 
             // try merge node with sibling
@@ -893,13 +909,15 @@ where
                             let node_key = std::cmp::max(&parent.child_key, sibling_key);
                             let node_ptr = NodePointer::new_leaf(merged_node);
                             merged = Some((node_key, node_ptr));
-                            merged_siblings.push(sibling_key);
-                            unfroze_on_fail.push((*sibling).clone());
+                            merged_sibling_key = Some(*sibling_key);
+                            mwcas.compare_exchange(
+                                sibling.status_word(),
+                                sibling_status,
+                                sibling_status.froze(),
+                            );
                             break;
                         }
-                        MergeMode::MergeFailed => {
-                            sibling.try_unfroze();
-                        }
+                        MergeMode::MergeFailed => {}
                     },
                     Interim(_) => {
                         panic!("Can't merge leaf with interim node")
@@ -916,13 +934,15 @@ where
                                 let node_key = std::cmp::max(&parent.child_key, sibling_key);
                                 let node_ptr = NodePointer::new_interim(merged_node);
                                 merged = Some((node_key, node_ptr));
-                                merged_siblings.push(sibling_key);
-                                unfroze_on_fail.push((*sibling).clone());
+                                merged_sibling_key = Some(*sibling_key);
+                                mwcas.compare_exchange(
+                                    sibling.status_word(),
+                                    sibling_status,
+                                    sibling_status.froze(),
+                                );
                                 break;
                             }
-                            MergeMode::MergeFailed => {
-                                sibling.try_unfroze();
-                            }
+                            MergeMode::MergeFailed => {}
                         }
                     }
                     Leaf(_) => panic!("Can't merge interim node with leaf node"),
@@ -930,41 +950,29 @@ where
             }
         }
 
-        if merged_siblings.is_empty() && merged.is_none() {
-            // no empty siblings found and no siblings have enough space to be merged
+        if merged.is_none() {
+            // no siblings have enough space to be merged
             return Err(MergeResult::Completed);
         }
 
-        // merge completed or compacted(some empty siblings removed):
+        let (merged_key, merged_node_ptr) = merged.unwrap();
+        let merged_sibling_key = merged_sibling_key.unwrap();
         // create new parent node with merged node and without empty/merged siblings.
-        let mut buffer = Vec::with_capacity(
-            parent.node().estimated_len(guard)
-                - merged_siblings.len()
-                - merged.as_ref().map_or_else(|| 0, |_| 1),
-        );
-        let underutilized_node_key = &parent.child_key;
+        let mut buffer = Vec::with_capacity(parent.node().estimated_len(guard) - 1);
+        let merged_node_key = &parent.child_key;
         for (key, val) in parent.node().iter(guard) {
-            if key == underutilized_node_key {
-                if let Some((key, node_ptr)) = &merged {
-                    // replace underutilized node by merged one
-                    buffer.push(((*key).clone(), HeapPointer::new(node_ptr.clone())));
-                } else {
-                    // node was not merged, copy as is
-                    buffer.push((key.clone(), HeapPointer::new(val.read(guard).clone())));
-                }
-            } else if !merged_siblings.contains(&key) {
-                // remove merged siblings
+            if key == merged_node_key {
+                // replace underutilized node by merged one
+                buffer.push((
+                    (*merged_key).clone(),
+                    HeapPointer::new(merged_node_ptr.clone()),
+                ));
+            } else if key != merged_sibling_key {
+                // remove merged sibling
                 buffer.push((key.clone(), HeapPointer::new(val.read(guard).clone())));
             }
         }
         Ok(InterimNode::new_readonly(buffer))
-    }
-
-    #[inline(always)]
-    fn unfroze(nodes: Vec<NodePointer<K, V>>) {
-        for node in nodes {
-            node.try_unfroze();
-        }
     }
 
     fn split_leaf(&self, path_to_leaf: TraversePath<K, V>, guard: &Guard) {
@@ -983,21 +991,21 @@ where
         mut path: TraversePath<'g, K, V>,
         guard: &'g Guard,
     ) -> Option<TraversePath<'g, K, V>> {
-        if !path.node_pointer.try_froze() {
-            // someone already try to split/merge node
-            return None;
-        }
-
         let parent = path.parents.pop();
         if parent.is_none() {
             self.split_root(path.node_pointer, guard);
             return None;
         }
 
+        if !path.node_pointer.try_froze() {
+            // someone already try to split/merge node
+            return None;
+        }
+
         // freeze node to ensure that no one can modify it during split
         let parent = parent.unwrap();
-        if !parent.node().try_froze(guard) {
-            // someone already try to split/merge node
+        let parent_status = parent.node().status_word().read(guard);
+        if parent_status.is_frozen() {
             path.node_pointer.try_unfroze();
             return None;
         }
@@ -1008,18 +1016,24 @@ where
                 // node was split: create new parent which links to 2 new children which replace
                 // original overflow node
                 let mut mwcas = MwCas::new();
+                mwcas.compare_exchange(
+                    parent.node().status_word(),
+                    parent_status,
+                    parent_status.froze(),
+                );
                 if let Some(grand_parent) = path.parents.last() {
                     let status = grand_parent.node().status_word().read(guard);
                     if !status.is_frozen() {
+                        // check that grandparent is not frozen and increase it version
+                        // (because we make in-place update of link to parent node)
                         mwcas.compare_exchange(
                             grand_parent.node().status_word(),
                             status,
-                            status.clone(),
+                            status.inc_version(),
                         );
                     } else {
                         // retry split again
                         path.node_pointer.try_unfroze();
-                        parent.node().try_unfroze(guard);
                         return None;
                     }
                 }
@@ -1029,7 +1043,6 @@ where
                 mwcas.compare_exchange(parent.cas_pointer, parent.node_pointer, new_parent);
                 if !mwcas.exec(guard) {
                     path.node_pointer.try_unfroze();
-                    parent.node().try_unfroze(guard);
                 }
                 None
             }
@@ -1037,17 +1050,20 @@ where
                 // node overflow caused by too many updates => replace overflow node
                 // with new compacted node which can accept more elements
                 let mut mwcas = MwCas::new();
+                mwcas.compare_exchange(
+                    parent.node().status_word(),
+                    parent_status,
+                    parent_status.inc_version(),
+                );
                 mwcas.compare_exchange(path.cas_pointer, path.node_pointer, compacted_node);
                 if !mwcas.exec(guard) {
                     path.node_pointer.try_unfroze();
                 }
-                parent.node().try_unfroze(guard);
                 None
             }
             SplitResult::ParentOverflow => {
                 // parent node is full and should be split before we can insert new child
                 path.node_pointer.try_unfroze();
-                parent.node().try_unfroze(guard);
                 Some(TraversePath {
                     cas_pointer: parent.cas_pointer,
                     node_pointer: parent.node_pointer,
@@ -1058,9 +1074,9 @@ where
     }
 
     fn split_root(&self, root: &NodePointer<K, V>, guard: &Guard) {
-        // must be already frozen
-        let root_status = root.status_word().read(guard);
-        debug_assert!(root_status.is_frozen());
+        if !root.try_froze() {
+            return;
+        }
 
         let new_root = match root {
             Leaf(cur_root) => {
@@ -1153,7 +1169,7 @@ where
             }
 
             let mut sorted_elems = Vec::with_capacity(node_len + 1);
-            for (key, val) in parent_node.iter(&guard) {
+            for (key, val) in parent_node.iter(guard) {
                 // overflowed node found inside parent, replace it by 2 new nodes
                 if underflow_node_key == key {
                     sorted_elems.push((left_key.clone(), HeapPointer::new(left_child.clone())));
@@ -1255,25 +1271,17 @@ where
                         // No place found for the key, we need to grow the tree.
                         // Greatest element of interim node will serve as +Inf node to
                         // accommodate new KV.
-                        if self.insert_pos_inf_node(
-                            next_node,
-                            node_pointer,
-                            node,
-                            parents.last(),
+                        self.insert_pos_inf_node(
+                            TraversePath {
+                                cas_pointer: next_node,
+                                node_pointer,
+                                parents,
+                            },
                             guard,
-                        ) {
-                            // current interim was replaced in parent node, restart from it
-                            parents
-                                // TODO: here we had last() instead of pop(), no tests found the bug
-                                .pop()
-                                .map(|n| n.cas_pointer)
-                                .map_or_else(|| &self.root, |n| n)
-                        } else {
-                            // can't replace interim node, someone already change tree shape,
-                            // restart from root
-                            parents = Vec::new();
-                            &self.root
-                        }
+                        );
+                        // tree is changed, restart from root
+                        parents = Vec::new();
+                        &self.root
                     } else {
                         return None;
                     }
@@ -1294,54 +1302,43 @@ where
     /// contains link to leaf with greatest element. This update will replace key of greatest
     /// element in interim node by +Inf key. This updated interim can now accept new keys which
     /// are greater than other keys of the tree.
-    fn insert_pos_inf_node<'g>(
-        &'g self,
-        // link to node in the parent node
-        node_link: &NodeLink<K, V>,
-        // pointer to interim node(value read from parent link)
-        node_pointer: &NodePointer<K, V>,
-        node: &ArcInterimNode<K, V>,
-        // reference to parent node if exists, otherwise node is root of the tree
-        parent_opt: Option<&Parent<K, V>>,
-        guard: &'g Guard,
-    ) -> bool {
-        if !node.try_froze(guard) {
-            // someone already froze this interim node, restart search from root
-            return false;
-        }
+    fn insert_pos_inf_node<'g>(&'g self, mut path: TraversePath<K, V>, guard: &'g Guard) -> bool {
+        let parent = Parent {
+            child_key: Key::pos_infinite(), // key is ignored in this context
+            node_pointer: path.node_pointer,
+            cas_pointer: path.cas_pointer,
+        };
+        path.parents.push(parent);
 
-        let mut elems: Vec<(Key<K>, NodeLink<K, V>)> = node
-            .iter(guard)
-            .map(|(key, val)| (key.clone(), val.clone()))
-            .collect();
-        elems.last_mut().unwrap().0 = Key::pos_infinite();
-        let new_interim = InterimNode::new_readonly(elems);
+        // update key of greatest node to +Inf on all levels of tree
         let mut mwcas = MwCas::new();
-        if let Some(parent) = parent_opt {
-            let status = parent.node().status_word().read(guard);
-            // check that parent not is not frozen during update one of
-            // it's children
-            if !status.is_frozen() {
-                mwcas.compare_exchange(parent.node().status_word(), status, status.clone());
-            } else {
-                // someone already froze this interim node, restart search from root
-                node.try_unfroze(guard);
+        for interim in path.parents {
+            let node = interim.node_pointer.to_interim_node();
+            let status_word = node.status_word().read(guard);
+            if status_word.is_frozen() {
                 return false;
             }
+            mwcas.compare_exchange(
+                interim.node_pointer.status_word(),
+                status_word,
+                status_word.inc_version(),
+            );
+
+            let mut elems: Vec<(Key<K>, NodeLink<K, V>)> = node
+                .iter(guard)
+                .map(|(key, val)| (key.clone(), val.clone()))
+                .collect();
+            elems.last_mut().unwrap().0 = Key::pos_infinite();
+            let new_interim = InterimNode::new_readonly(elems);
+            // update link in parent node to new interim node
+            mwcas.compare_exchange(
+                interim.cas_pointer,
+                interim.node_pointer,
+                NodePointer::new_interim(new_interim),
+            );
         }
 
-        // update link in parent node to new interim node
-        mwcas.compare_exchange(
-            node_link,
-            node_pointer,
-            NodePointer::new_interim(new_interim),
-        );
-        if !mwcas.exec(guard) {
-            node.try_unfroze(guard);
-            false
-        } else {
-            true
-        }
+        mwcas.exec(guard)
     }
 
     /// Find leaf node which can contain passed key

@@ -8,14 +8,12 @@ pub struct StatusWord {
 }
 
 impl StatusWord {
-    // TODO: add node version to remove code which froze interim nodes during merge/split
-    // this required to ensure that node not changed while we iterate over it. Currently this
-    // requires unconditional froze of interim node. Version field can solve this problem and
-    // allow more optimistic concurrency.
     const FROZEN_MASK: u64 = 0x1000_0000_0000_0000;
     const DELETE_SIZE_MASK: u64 = 0x0000_0000_0000_FFFF;
     const RESERVED_RECORD_COUNT_MASK: u64 = 0x0000_0000_FFFF_0000;
     const RESERVED_RECORD_COUNT_SHIFT: u64 = 16;
+    const VERSION_MASK: u64 = 0x0000_FFFF_0000_0000;
+    const VERSION_SHIFT: u64 = 32;
 
     const fn zeroed() -> StatusWord {
         StatusWord { word: 0 }
@@ -39,6 +37,12 @@ impl StatusWord {
         Self::from(self).unfroze().build()
     }
 
+    pub fn inc_version(&self) -> StatusWord {
+        Self::from(self)
+            .version(self.version().checked_add(1).unwrap_or(0) as u16)
+            .build()
+    }
+
     pub fn reserve_entry(&self) -> StatusWord {
         debug_assert!(
             self.reserved_records() < u16::MAX,
@@ -47,6 +51,7 @@ impl StatusWord {
         );
         Self::from(self)
             .reserved_records(self.reserved_records() + 1)
+            .version(self.version().checked_add(1).unwrap_or(0) as u16)
             .build()
     }
 
@@ -58,6 +63,7 @@ impl StatusWord {
         );
         Self::from(self)
             .delete_records(self.deleted_records() as u16 + 1)
+            .version(self.version().checked_add(1).unwrap_or(0) as u16)
             .build()
     }
 
@@ -74,6 +80,14 @@ impl StatusWord {
     /// How many KVs was removed
     pub fn deleted_records(&self) -> u16 {
         (self.word & Self::DELETE_SIZE_MASK) as u16
+    }
+
+    /// Return "version" of this node.
+    ///
+    /// Each change to node increase version. When number of changes overflows `u16` type,
+    /// version reset to 0. This field used to detect in-place changes inside interim nodes.
+    pub fn version(&self) -> u16 {
+        ((self.word & Self::VERSION_MASK) >> Self::VERSION_SHIFT) as u16
     }
 }
 
@@ -112,6 +126,12 @@ impl StatusWordBuilder {
         self
     }
 
+    pub fn version(&mut self, version: u16) -> &mut StatusWordBuilder {
+        self.0.word &= !StatusWord::VERSION_MASK;
+        self.0.word |= (version as u64) << StatusWord::VERSION_SHIFT;
+        self
+    }
+
     pub fn delete_records(&mut self, size: u16) -> &mut StatusWordBuilder {
         self.0.word &= !StatusWord::DELETE_SIZE_MASK;
         self.0.word |= size as u64;
@@ -126,7 +146,8 @@ impl StatusWordBuilder {
 impl Debug for StatusWord {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "status_word: frozen={};reserved={};delete size={}",
+            "status_word: version={};frozen={};reserved={};delete size={}",
+            self.version(),
             self.is_frozen(),
             self.reserved_records(),
             self.deleted_records(),
@@ -230,5 +251,41 @@ mod tests {
         assert!(!new_status_word.is_frozen());
         assert_eq!(new_status_word.deleted_records(), 2);
         assert_eq!(new_status_word.reserved_records(), 4);
+    }
+
+    #[test]
+    fn version() {
+        let mut status_word = StatusWordBuilder::new().build();
+        status_word = StatusWord::from(&status_word)
+            .version(1)
+            .delete_records(2)
+            .reserved_records(3)
+            .build();
+
+        assert!(!status_word.is_frozen());
+        assert_eq!(status_word.version(), 1);
+        assert_eq!(status_word.deleted_records(), 2);
+        assert_eq!(status_word.reserved_records(), 3);
+
+        status_word = status_word.reserve_entry();
+        assert!(!status_word.is_frozen());
+        assert_eq!(status_word.version(), 2);
+        assert_eq!(status_word.deleted_records(), 2);
+        assert_eq!(status_word.reserved_records(), 4);
+
+        status_word = status_word.delete_entry();
+        assert!(!status_word.is_frozen());
+        assert_eq!(status_word.version(), 3);
+        assert_eq!(status_word.deleted_records(), 3);
+        assert_eq!(status_word.reserved_records(), 4);
+
+        let mut status_word = StatusWordBuilder::new().build();
+        for i in 0..u16::MAX {
+            assert!(!status_word.is_frozen());
+            assert_eq!(status_word.version(), i);
+            status_word = status_word.inc_version();
+        }
+        status_word = status_word.inc_version();
+        assert_eq!(status_word.version(), 0);
     }
 }

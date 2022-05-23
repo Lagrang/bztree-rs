@@ -524,15 +524,15 @@ fn check_kv_drop() {
     let guard = unsafe { crossbeam_epoch::unprotected() };
     for i in &vec {
         if thread_rng().gen_bool(0.5) {
-            tree.insert(i.to_string(), Droppable::new(&ref_cnt), &guard);
+            tree.insert(i.to_string(), Droppable::new(&ref_cnt), guard);
         } else {
-            tree.upsert(i.to_string(), Droppable::new(&ref_cnt), &guard);
+            tree.upsert(i.to_string(), Droppable::new(&ref_cnt), guard);
         }
     }
 
     vec.shuffle(&mut thread_rng());
     for i in vec {
-        tree.delete(&i.to_string(), &guard);
+        tree.delete(&i.to_string(), guard);
     }
 
     assert_eq!(ref_cnt.load(Ordering::Relaxed), 0);
