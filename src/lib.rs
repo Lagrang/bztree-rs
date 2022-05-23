@@ -1250,8 +1250,7 @@ where
         loop {
             next_node = match next_node.read(guard) {
                 node_pointer @ Interim(node) => {
-                    if let Some((child_node_key, child_node_ptr)) =
-                        node.closest_mut(search_key, guard)
+                    if let Some((child_node_key, child_node_ptr)) = node.closest(search_key, guard)
                     {
                         // found node which can contain the key
                         parents.push(Parent {
@@ -1582,14 +1581,6 @@ impl<K: Ord, V> NodePointer<K, V> {
         match self {
             Interim(_) => panic!("Pointer points to interim node"),
             Leaf(node) => node,
-        }
-    }
-
-    #[inline]
-    fn is_leaf_node(&self) -> bool {
-        match self {
-            Interim(_) => false,
-            Leaf(_) => true,
         }
     }
 

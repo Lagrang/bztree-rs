@@ -274,7 +274,7 @@ impl<K: Ord, V> Node<K, V> {
     ///
     /// **Warning**: this method can be called only for **read-only** nodes, it ignores
     /// any updates made after node creation.
-    pub fn closest_mut<'g, Q>(&'g self, key: &Q, _: &'g Guard) -> Option<(&'g K, &'g mut V)>
+    pub fn closest<'g, Q>(&'g self, key: &Q, _: &'g Guard) -> Option<(&'g K, &'g mut V)>
     where
         K: PartialOrd<Q>,
         V: Clone,
@@ -314,49 +314,6 @@ impl<K: Ord, V> Node<K, V> {
             // passed key is greater than any element in block
             None
         }
-    }
-
-    /// Get value which key is equal or greater that to passed key.  
-    ///
-    /// **Warning**: this method can be called only for **read-only** nodes, it ignores
-    /// any updates made after node creation.
-    pub fn closest<'g, Q>(&'g self, key: &Q, _: &'g Guard) -> Option<(&'g K, &'g V)>
-    where
-        K: PartialOrd<Q>,
-        V: Clone,
-    {
-        debug_assert!(self.readonly);
-        if self.sorted_len == 0 {
-            return None;
-        }
-
-        self.data_block[0..self.sorted_len]
-            .binary_search_by(|entry| {
-                // sorted block doesn't contain reserved entries, so it can be ignored here.
-                // sorted block can contain deleted entries, but metadata of removed entries
-                // still points to valid keys, so it's safe to compare them here.
-                unsafe { entry.key() }
-                    .borrow()
-                    .partial_cmp(key)
-                    .expect("Q type must always be comparable with K")
-            })
-            .map_or_else(
-                |closest_pos| {
-                    if closest_pos < self.sorted_len {
-                        // find position which points to element which is greater that passed key
-                        let kv = &self.data_block[closest_pos];
-                        Some(unsafe { (kv.key(), kv.value()) })
-                    } else {
-                        // passed key is greater than any element in block
-                        None
-                    }
-                },
-                |index| {
-                    // find exact match for key
-                    let kv = &self.data_block[index];
-                    Some(unsafe { (kv.key(), kv.value()) })
-                },
-            )
     }
 
     /// Get left and right siblings for entry identified by key.  
@@ -526,15 +483,6 @@ impl<K: Ord, V> Node<K, V> {
             .map(|kv| (kv.key, kv.value));
     }
 
-    pub fn first_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
-    where
-        K: Ord,
-    {
-        return self
-            .edge_kv(NodeEdge::Left, guard)
-            .map(|kv| (kv.key, kv.value));
-    }
-
     pub fn split_leaf(&self, guard: &Guard) -> SplitMode<K, V>
     where
         K: Clone + Ord,
@@ -545,10 +493,7 @@ impl<K: Ord, V> Node<K, V> {
             "Node must be frozen before split"
         );
 
-        let mut kvs: Vec<(K, V)> = self
-            .iter(guard)
-            .map(|(k, v)| ((*k).clone(), (*v).clone()))
-            .collect();
+        let mut kvs: Vec<(K, V)> = self.clone_all_kv(guard);
         let capacity = self.capacity() as u16;
         if kvs.len() < capacity as usize {
             // node contains too many updates/deletes which cause split
@@ -573,10 +518,7 @@ impl<K: Ord, V> Node<K, V> {
             "Node must be frozen before split"
         );
 
-        let mut kvs: Vec<(K, V)> = self
-            .iter(guard)
-            .map(|(k, v)| ((*k).clone(), (*v).clone()))
-            .collect();
+        let mut kvs: Vec<(K, V)> = self.clone_all_kv(guard);
         let split_point = kvs.len() / 2;
         let left = Self::new_readonly(kvs.drain(..split_point).collect());
         let right = Self::new_readonly(kvs);
@@ -741,6 +683,16 @@ impl<K: Ord, V> Node<K, V> {
         let mut mwcas = MwCas::new();
         mwcas.compare_exchange(&self.status_word, cur_status, cur_status.unfroze());
         mwcas.exec(guard)
+    }
+
+    fn clone_all_kv(&self, guard: &Guard) -> Vec<(K, V)>
+    where
+        K: Clone + Ord,
+        V: Clone,
+    {
+        self.iter(guard)
+            .map(|(k, v)| ((*k).clone(), (*v).clone()))
+            .collect()
     }
 
     fn get_internal<'g, Q>(

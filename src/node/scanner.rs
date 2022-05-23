@@ -117,16 +117,6 @@ where
         }
     }
 
-    pub fn peek_next(&mut self) -> Option<(&'a K, &'a V)> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.fwd_idx as usize] as usize;
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-
     pub fn peek_next_back(&mut self) -> Option<(&'a K, &'a V)> {
         if self.rev_idx >= self.fwd_idx {
             let index = self.kv_indexes[self.rev_idx as usize] as usize;
