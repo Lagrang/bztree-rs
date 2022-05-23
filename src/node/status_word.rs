@@ -160,12 +160,12 @@ impl From<StatusWord> for u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::status_word::{StatusWord, StatusWordBuilder};
+    use crate::node::status_word::{StatusWord, StatusWordBuilder};
 
     #[test]
     fn create_empty_status_word() {
         let status_word = StatusWord { word: 0 };
-        assert_eq!(status_word.is_frozen(), false);
+        assert!(!status_word.is_frozen());
         assert_eq!(status_word.deleted_records(), 0);
         assert_eq!(status_word.reserved_records(), 0);
     }
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn create_filled_status_word() {
         let mut status_word = StatusWordBuilder::new().build();
-        assert_eq!(status_word.is_frozen(), false);
+        assert!(!status_word.is_frozen());
 
         for i in 0u16..u16::MAX {
             status_word = StatusWord::from(&status_word)
@@ -181,13 +181,13 @@ mod tests {
                 .delete_records(i as u16)
                 .reserved_records(i as u16)
                 .build();
-            assert_eq!(status_word.is_frozen(), true);
+            assert!(status_word.is_frozen());
             assert_eq!(status_word.deleted_records(), i);
             assert_eq!(status_word.reserved_records(), i);
 
             let status_word = status_word.delete_entry();
             assert_eq!(status_word.deleted_records(), i + 1);
-            assert_eq!(status_word.is_frozen(), true);
+            assert!(status_word.is_frozen());
             assert_eq!(status_word.reserved_records(), i);
         }
     }
@@ -201,15 +201,15 @@ mod tests {
             .build();
 
         let new_status_word = status_word.froze();
-        assert_eq!(status_word.is_frozen(), false);
+        assert!(!status_word.is_frozen());
         assert_eq!(status_word.deleted_records(), 2);
         assert_eq!(status_word.reserved_records(), 3);
 
-        assert_eq!(new_status_word.is_frozen(), true);
+        assert!(new_status_word.is_frozen());
         assert_eq!(new_status_word.deleted_records(), 2);
         assert_eq!(new_status_word.reserved_records(), 3);
 
-        assert_eq!(new_status_word.unfroze().is_frozen(), false);
+        assert!(!new_status_word.unfroze().is_frozen());
         assert_eq!(new_status_word.deleted_records(), 2);
         assert_eq!(new_status_word.reserved_records(), 3);
     }
@@ -222,12 +222,12 @@ mod tests {
             .reserved_records(3)
             .build();
 
-        assert_eq!(status_word.is_frozen(), false);
+        assert!(!status_word.is_frozen());
         assert_eq!(status_word.deleted_records(), 2);
         assert_eq!(status_word.reserved_records(), 3);
 
         let new_status_word = status_word.reserve_entry();
-        assert_eq!(new_status_word.is_frozen(), false);
+        assert!(!new_status_word.is_frozen());
         assert_eq!(new_status_word.deleted_records(), 2);
         assert_eq!(new_status_word.reserved_records(), 4);
     }

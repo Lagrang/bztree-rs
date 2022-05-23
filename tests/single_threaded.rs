@@ -65,6 +65,8 @@ fn fill(tree: &BzTree<Key<usize>, String>, size: usize) -> Vec<(Key<usize>, Stri
 //TODO: add test which will fill the tree and then pop all elements
 //TODO: add test which will fill the tree and then remove all elements
 //TODO: add test which will mix all operations
+//TODO: add tests which will create different patterns of inserts/deleted: inserts at beginning,
+// at the end, remove from the end, insert again into the end and so on.
 
 #[test]
 fn sequential_key_insert() {

@@ -38,14 +38,13 @@ extern crate core;
 
 mod node;
 mod scanner;
-mod status_word;
 
 use crate::node::{DeleteError, InsertError, MergeMode, Node, SplitMode};
 use crate::scanner::Scanner;
 use crate::NodePointer::{Interim, Leaf};
 use crossbeam_epoch::Guard;
 use mwcas::{HeapPointer, MwCas};
-use status_word::StatusWord;
+use node::status_word::StatusWord;
 use std::borrow::Borrow;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::option::Option::Some;
@@ -86,11 +85,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// # Thread safety
 /// BzTree can be safely shared between threads, e.g. it implements [Send] ans [Sync].
-///
 pub struct BzTree<K: Ord, V> {
-    root: HeapPointer<NodePointer<K, V>>,
+    root: NodeLink<K, V>,
     node_size: usize,
 }
+
+type NodeLink<K, V> = HeapPointer<NodePointer<K, V>>;
 
 unsafe impl<K: Ord, V> Send for BzTree<K, V> {}
 
@@ -104,7 +104,7 @@ type LeafNode<K, V> = Node<K, V>;
 /// Interim node always contain special guard cell which represent
 /// 'positive infinite' key. This cell used to store link to node
 /// which keys greater than any other key in current interim node.
-type InterimNode<K, V> = Node<Key<K>, HeapPointer<NodePointer<K, V>>>;
+type InterimNode<K, V> = Node<Key<K>, NodeLink<K, V>>;
 
 impl<K, V> BzTree<K, V>
 where
@@ -248,8 +248,8 @@ where
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
             if let Some(node) = self.find_leaf_for_key(&search_key, false, guard) {
-                let len = unsafe { (*node).estimated_len(guard) };
-                match unsafe { (*node).delete(key.borrow(), guard) } {
+                let len = node.estimated_len(guard);
+                match node.delete(key.borrow(), guard) {
                     Ok(val) => {
                         if self.should_merge(len - 1) {
                             self.merge_recursive(&search_key, guard);
@@ -1237,7 +1237,7 @@ where
         Q: Ord,
     {
         let mut parents = Vec::new();
-        let mut next_node: &HeapPointer<NodePointer<K, V>> = &self.root;
+        let mut next_node: &NodeLink<K, V> = &self.root;
         loop {
             next_node = match next_node.read(guard) {
                 node_pointer @ Interim(node) => {
@@ -1296,9 +1296,12 @@ where
     /// are greater than other keys of the tree.
     fn insert_pos_inf_node<'g>(
         &'g self,
-        next_node: &HeapPointer<NodePointer<K, V>>,
+        // link to node in the parent node
+        node_link: &NodeLink<K, V>,
+        // pointer to interim node(value read from parent link)
         node_pointer: &NodePointer<K, V>,
         node: &ArcInterimNode<K, V>,
+        // reference to parent node if exists, otherwise node is root of the tree
         parent_opt: Option<&Parent<K, V>>,
         guard: &'g Guard,
     ) -> bool {
@@ -1307,7 +1310,7 @@ where
             return false;
         }
 
-        let mut elems: Vec<(Key<K>, HeapPointer<NodePointer<K, V>>)> = node
+        let mut elems: Vec<(Key<K>, NodeLink<K, V>)> = node
             .iter(guard)
             .map(|(key, val)| (key.clone(), val.clone()))
             .collect();
@@ -1329,7 +1332,7 @@ where
 
         // update link in parent node to new interim node
         mwcas.compare_exchange(
-            next_node,
+            node_link,
             node_pointer,
             NodePointer::new_interim(new_interim),
         );
@@ -1363,7 +1366,7 @@ where
         K: Borrow<Q>,
         Q: Ord,
     {
-        let mut next_node: (&HeapPointer<NodePointer<K, V>>, Option<&Key<K>>) = (&self.root, None);
+        let mut next_node: (&NodeLink<K, V>, Option<&Key<K>>) = (&self.root, None);
         loop {
             next_node = match next_node.0.read(guard) {
                 Interim(node) => {
@@ -1404,7 +1407,7 @@ enum SplitResult<K: Ord, V> {
 
 struct TraversePath<'g, K: Ord, V> {
     /// Node pointer of this node inside parent(used by MwCAS).
-    cas_pointer: &'g HeapPointer<NodePointer<K, V>>,
+    cas_pointer: &'g NodeLink<K, V>,
     /// Pointer to found node inside tree(read from CAS pointer during traversal)
     node_pointer: &'g NodePointer<K, V>,
     /// Chain of parents including root node(starts from root, vector end is most closest parent)
@@ -1698,7 +1701,7 @@ impl<K: Borrow<Q>, Q: Eq> PartialEq<Key<Q>> for Key<K> {
 
 struct Parent<'a, K: Ord, V> {
     /// Node pointer of this parent inside grandparent(used by MwCAS).
-    cas_pointer: &'a HeapPointer<NodePointer<K, V>>,
+    cas_pointer: &'a NodeLink<K, V>,
     /// Parent node pointer inside grandparent at moment of tree traversal(actual value read from
     /// cas_pointer at some moment in time).
     node_pointer: &'a NodePointer<K, V>,

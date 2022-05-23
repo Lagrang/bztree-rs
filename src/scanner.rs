@@ -1,7 +1,6 @@
-use crate::node::NodeScanner;
-use crate::{InterimNode, Key, LeafNode, NodePointer};
+use crate::node::scanner::NodeScanner;
+use crate::{InterimNode, Key, LeafNode, NodeLink, NodePointer};
 use crossbeam_epoch::Guard;
-use mwcas::HeapPointer;
 use std::borrow::Borrow;
 use std::ops::{Bound, RangeBounds};
 use std::option::Option::Some;
@@ -14,7 +13,7 @@ pub struct Scanner<'g, K: Ord, V, Range> {
 }
 
 struct Iter<'g, K: Ord, V> {
-    interims: Vec<NodeScanner<'g, Key<K>, HeapPointer<NodePointer<K, V>>>>,
+    interims: Vec<NodeScanner<'g, Key<K>, NodeLink<K, V>>>,
     iter: Option<NodeScanner<'g, K, V>>,
     last_key: Option<&'g K>,
 }

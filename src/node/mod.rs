@@ -1,12 +1,18 @@
-use crate::status_word::StatusWord;
+mod metadata;
+pub mod scanner;
+pub mod status_word;
+
+use crate::node::scanner::NodeScanner;
 use crossbeam_epoch::Guard;
+use metadata::Metadata;
 use mwcas::{HeapPointer, MwCas, U64Pointer};
+use status_word::StatusWord;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::mem::MaybeUninit;
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
 use std::option::Option::Some;
 use std::{mem, ptr};
 
@@ -400,7 +406,7 @@ impl<K: Ord, V> Node<K, V> {
         Q: Ord + 'g,
         Range: RangeBounds<Q> + 'g,
     {
-        NodeScanner::new(self.status_word.read(guard), &self, key_range, guard)
+        NodeScanner::new(self.status_word.read(guard), self, key_range, guard)
     }
 
     pub fn iter<'g>(&'g self, guard: &'g Guard) -> NodeScanner<K, V>
@@ -529,22 +535,15 @@ impl<K: Ord, V> Node<K, V> {
                                 min_kv
                             }
                         })
-                        .or_else(|| Some(entry));
+                        .or(Some(entry));
                 }
             }
         }
 
-        let sorted_min = self.data_block[..self.sorted_len]
-            .iter()
-            .filter_map(|entry| {
-                let metadata: Metadata = entry.metadata.read(guard).into();
-                if metadata.is_visible() {
-                    Some(entry)
-                } else {
-                    None
-                }
-            })
-            .next();
+        let sorted_min = self.data_block[..self.sorted_len].iter().find(|entry| {
+            let metadata: Metadata = entry.metadata.read(guard).into();
+            metadata.is_visible()
+        });
 
         let min_kv = if sorted_min.is_none() {
             unsorted_min
@@ -559,7 +558,7 @@ impl<K: Ord, V> Node<K, V> {
                 unsorted_min
             }
         };
-        return min_kv.map(|kv| unsafe { (kv.key(), kv.value()) });
+        min_kv.map(|kv| unsafe { (kv.key(), kv.value()) })
     }
 
     pub fn first_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
@@ -567,7 +566,7 @@ impl<K: Ord, V> Node<K, V> {
         K: Ord,
     {
         let status_word = self.status_word().read(guard);
-        return self.conditional_first_kv(status_word, guard);
+        self.conditional_first_kv(status_word, guard)
     }
 
     pub fn split_leaf(&self, guard: &Guard) -> SplitMode<K, V>
@@ -1136,189 +1135,6 @@ impl<K, V> Entry<K, V> {
     }
 }
 
-pub struct NodeScanner<'a, K: Ord, V> {
-    node: &'a Node<K, V>,
-    // BzTree node can allocate maximum u16::MAX records,
-    // use u16 instead of usize to reduce size of scanner
-    kv_indexes: Vec<u16>,
-    fwd_idx: u16,
-    rev_idx: u16,
-}
-
-impl<'a, K, V> NodeScanner<'a, K, V>
-where
-    K: Ord,
-{
-    fn new<Q>(
-        status_word: &StatusWord,
-        node: &'a Node<K, V>,
-        key_range: impl RangeBounds<Q>,
-        guard: &'a Guard,
-    ) -> Self
-    where
-        K: Borrow<Q>,
-        Q: Ord,
-    {
-        let mut kvs: Vec<u16> = Vec::with_capacity(status_word.reserved_records() as usize);
-
-        if node.readonly || status_word.reserved_records() as usize == node.sorted_len {
-            if node.sorted_len > 0 {
-                let sorted_block = &node.data_block[0..node.sorted_len];
-                let start_idx = match key_range.start_bound() {
-                    Bound::Excluded(key) => sorted_block
-                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
-                        .map_or_else(|index| index, |index| index + 1),
-                    Bound::Included(key) => sorted_block
-                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
-                        .map_or_else(|index| index, |index| index),
-                    Bound::Unbounded => 0,
-                };
-
-                let end_idx = match key_range.end_bound() {
-                    Bound::Excluded(key) => sorted_block
-                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
-                        .map_or_else(|index| index, |index| index),
-                    Bound::Included(key) => sorted_block
-                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
-                        .map_or_else(|index| index, |index| index + 1),
-                    Bound::Unbounded => node.sorted_len,
-                };
-
-                if !node.readonly {
-                    (start_idx..end_idx).for_each(|i| {
-                        let metadata: Metadata = node.data_block[i].metadata.read(guard).into();
-                        if metadata.is_visible() {
-                            kvs.push(i as u16);
-                        }
-                    });
-                } else {
-                    (start_idx..end_idx).for_each(|i| kvs.push(i as u16));
-                }
-            }
-        } else {
-            let mut scanned_keys = BTreeSet::new();
-            // use reversed iterator because unsorted part at end of KV block has most recent values
-            for i in (0..status_word.reserved_records() as usize).rev() {
-                let entry = &node.data_block[i];
-                let metadata = loop {
-                    let metadata: Metadata = entry.metadata.read(guard).into();
-                    if !metadata.is_reserved() {
-                        break metadata;
-                    }
-                    // someone try to add entry at same time, continue check same entry
-                    // until reserved entry will become valid
-                };
-
-                // if is first time when we see this key, we return it
-                // otherwise, most recent version(even deletion) of key
-                // already seen by scanner and older versions must be ignored.
-                if metadata.visible_or_deleted() {
-                    let key = unsafe { node.data_block[i].key() };
-                    if key_range.contains(key.borrow())
-                        && scanned_keys.insert(key)
-                        && metadata.is_visible()
-                    {
-                        kvs.push(i as u16);
-                    }
-                }
-            }
-
-            kvs.sort_by(|index1, index2| {
-                let key1 = unsafe { node.data_block[*index1 as usize].key() };
-                let key2 = unsafe { node.data_block[*index2 as usize].key() };
-                key1.cmp(key2)
-            });
-        }
-
-        if kvs.is_empty() {
-            return NodeScanner {
-                // move 'forward' index in front of 'reversed' to simulate empty scanner
-                fwd_idx: 1,
-                rev_idx: 0,
-                kv_indexes: kvs,
-                node,
-            };
-        }
-
-        NodeScanner {
-            fwd_idx: 0,
-            rev_idx: (kvs.len() - 1) as u16,
-            kv_indexes: kvs,
-            node,
-        }
-    }
-
-    pub fn peek_next(&mut self) -> Option<(&'a K, &'a V)> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.fwd_idx as usize] as usize;
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-
-    pub fn peek_next_back(&mut self) -> Option<(&'a K, &'a V)> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.rev_idx as usize] as usize;
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-}
-
-impl<'a, K: Ord, V> Iterator for NodeScanner<'a, K, V> {
-    type Item = (&'a K, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.fwd_idx as usize] as usize;
-            self.fwd_idx += 1;
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = if self.rev_idx < self.fwd_idx {
-            0
-        } else {
-            (self.rev_idx - self.fwd_idx + 1) as usize
-        };
-        (size, Some(size))
-    }
-}
-
-impl<'a, K: Ord, V> DoubleEndedIterator for NodeScanner<'a, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.rev_idx as usize] as usize;
-            if self.rev_idx > 0 {
-                self.rev_idx -= 1;
-            } else {
-                // reversed iteration reaches 0 element,
-                // to break iteration, we move 'forward' index in front of 'reversed'
-                // because we can't set -1 to rev_idx because it unsigned.
-                self.fwd_idx = self.rev_idx + 1;
-            }
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-}
-
-impl<'a, K: Ord, V> ExactSizeIterator for NodeScanner<'a, K, V> {
-    fn len(&self) -> usize {
-        self.size_hint().0
-    }
-}
-
 pub enum MergeMode<K: Ord, V> {
     /// Merge completed successfully. Returns new node which contains
     /// elements of both source nodes.
@@ -1375,93 +1191,6 @@ pub enum SearchError {
     KeyNotFound,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-#[repr(transparent)]
-struct Metadata {
-    word: u64,
-}
-
-impl Metadata {
-    const NOT_USED_MASK: u64 = 0x0000_0000_0000_0004;
-    const RESERVED_MASK: u64 = 0x0000_0000_0000_0002;
-    const DELETED_MASK: u64 = 0x0000_0000_0000_0001;
-    const VISIBLE_MASK: u64 = 0x0000_0000_0000_0000;
-
-    #[inline(always)]
-    fn visible() -> Metadata {
-        Metadata {
-            word: Self::VISIBLE_MASK,
-        }
-    }
-
-    #[inline(always)]
-    fn reserved() -> Metadata {
-        Metadata {
-            word: Self::RESERVED_MASK,
-        }
-    }
-
-    #[inline(always)]
-    fn deleted() -> Metadata {
-        Metadata {
-            word: Self::DELETED_MASK,
-        }
-    }
-
-    #[inline(always)]
-    fn not_used() -> Metadata {
-        Metadata {
-            word: Self::NOT_USED_MASK,
-        }
-    }
-
-    #[inline(always)]
-    fn visible_or_deleted(&self) -> bool {
-        self.word < Self::RESERVED_MASK
-    }
-
-    #[inline(always)]
-    fn is_visible(&self) -> bool {
-        self.word == Self::VISIBLE_MASK
-    }
-
-    #[inline(always)]
-    fn is_deleted(&self) -> bool {
-        self.word == Self::DELETED_MASK
-    }
-
-    #[inline(always)]
-    fn is_reserved(&self) -> bool {
-        self.word == Self::RESERVED_MASK
-    }
-}
-
-impl From<u64> for Metadata {
-    fn from(word: u64) -> Self {
-        Metadata { word }
-    }
-}
-
-impl From<Metadata> for u64 {
-    fn from(word: Metadata) -> Self {
-        word.word
-    }
-}
-
-impl From<Metadata> for U64Pointer {
-    fn from(word: Metadata) -> Self {
-        Self::new(word.word)
-    }
-}
-
-impl From<U64Pointer> for Metadata {
-    fn from(word: U64Pointer) -> Self {
-        Self {
-            word: word.read(&crossbeam_epoch::pin()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1484,7 +1213,7 @@ mod tests {
     #[test]
     fn insert_and_search() {
         let elements = 500;
-        let mut node = create_str_node(elements);
+        let node = create_str_node(elements);
         for i in 0..elements {
             let guard = crossbeam_epoch::pin();
             let key = i.to_string();
@@ -1501,7 +1230,7 @@ mod tests {
     #[test]
     fn upsert_and_search() {
         let elements = 500;
-        let mut node = create_str_node(elements);
+        let node = create_str_node(elements);
         for i in 0..elements {
             let guard = crossbeam_epoch::pin();
             let key = i.to_string();
@@ -1518,7 +1247,7 @@ mod tests {
     #[test]
     fn insert_existing_key() {
         let guard = crossbeam_epoch::pin();
-        let mut node = create_str_node(2);
+        let node = create_str_node(2);
         let (key, value) = rand_kv();
         node.insert(key.clone(), value, &guard).unwrap();
         let result = node.insert(key, value, &guard);
@@ -1528,7 +1257,7 @@ mod tests {
     #[test]
     fn update_key() {
         let max_elements = 500;
-        let mut node = create_str_node(max_elements * 2); // upsert create new KV
+        let node = create_str_node(max_elements * 2); // upsert create new KV
         for i in 0..max_elements {
             let guard = crossbeam_epoch::pin();
             let key = i.to_string();
@@ -1548,7 +1277,7 @@ mod tests {
     #[test]
     fn delete_keys() {
         let elements = 128u16;
-        let mut node = create_wrapped_u16_node(elements * 2);
+        let node = create_wrapped_u16_node(elements * 2);
 
         for i in 0..elements {
             let guard = crossbeam_epoch::pin();
@@ -1574,7 +1303,7 @@ mod tests {
     #[test]
     fn delete_non_existing_keys() {
         let max_elements = 500;
-        let mut node = create_wrapped_u16_node(max_elements);
+        let node = create_wrapped_u16_node(max_elements);
 
         for i in 0..max_elements {
             let guard = crossbeam_epoch::pin();
@@ -1592,7 +1321,7 @@ mod tests {
     fn split_node() {
         for _ in 0..100 {
             let max_elements = thread_rng().gen_range(1..100);
-            let mut node = create_str_node(max_elements);
+            let node = create_str_node(max_elements);
             let mut elem_count = 0;
             let guard = crossbeam_epoch::pin();
             for _ in 0..max_elements {
@@ -1626,7 +1355,7 @@ mod tests {
     fn compact_node() {
         for _ in 0..100 {
             let elements = thread_rng().gen_range(1..100);
-            let mut node = create_str_node(elements * 2);
+            let node = create_str_node(elements * 2);
             let guard = crossbeam_epoch::pin();
             for i in 0..elements {
                 let key = i.to_string();
@@ -1681,16 +1410,8 @@ mod tests {
                 thread_rng().gen_range(0..expected_elems.len())
             };
             let (vec1, vec2) = expected_elems.split_at(split_point);
-            let node1 = Node::new_readonly(
-                vec1.iter()
-                    .map(|(k, v)| ((*k).clone(), (*v).clone()))
-                    .collect(),
-            );
-            let node2 = Node::new_readonly(
-                vec2.iter()
-                    .map(|(k, v)| ((*k).clone(), (*v).clone()))
-                    .collect(),
-            );
+            let node1 = Node::new_readonly(vec1.iter().map(|(k, v)| (**k, **v)).collect());
+            let node2 = Node::new_readonly(vec2.iter().map(|(k, v)| (**k, **v)).collect());
 
             let guard = crossbeam_epoch::pin();
             node1.try_froze(&guard);
@@ -1747,7 +1468,7 @@ mod tests {
     #[test]
     #[allow(clippy::reversed_empty_ranges)]
     fn scan_on_unsorted_node() {
-        let mut node = Node::with_capacity(150);
+        let node = Node::with_capacity(150);
 
         let min = 1;
         let max = 10;
@@ -1815,7 +1536,7 @@ mod tests {
 
         let max_elements = (sorted.len() * 5) as u16;
         let elems: Vec<(i32, i32)> = sorted.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut node = Node::init_with_capacity(elems, max_elements);
+        let node = Node::init_with_capacity(elems, max_elements);
 
         let guard = crossbeam_epoch::pin();
         node.insert(max, max + 1, &guard)
@@ -1873,7 +1594,7 @@ mod tests {
         let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)];
         let max_elements = (vec.len() * 4) as u16;
         let elems: Vec<(u32, u32)> = vec.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut node = Node::init_with_capacity(elems, max_elements);
+        let node = Node::init_with_capacity(elems, max_elements);
         node.insert(4, 4, &guard).unwrap();
         node.insert(5, 5, &guard).unwrap();
         node.insert(6, 6, &guard).unwrap();
@@ -1925,7 +1646,7 @@ mod tests {
         let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)];
         let max_elements = (vec.len() * 4) as u16;
         let elems: Vec<(u32, u32)> = vec.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut node = Node::init_with_capacity(elems, max_elements);
+        let node = Node::init_with_capacity(elems, max_elements);
 
         node.insert(4, 4, &guard).unwrap();
         node.insert(5, 6, &guard).unwrap();
@@ -1957,7 +1678,7 @@ mod tests {
         let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)];
         let max_elements = (vec.len() * 4) as u16;
         let elems: Vec<(u32, u32)> = vec.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut node = Node::init_with_capacity(elems, max_elements);
+        let node = Node::init_with_capacity(elems, max_elements);
 
         node.insert(4, 4, &guard).unwrap();
         node.insert(5, 5, &guard).unwrap();
@@ -1985,7 +1706,7 @@ mod tests {
     #[test]
     fn iter_on_empty_sorted_space() {
         let guard = crossbeam_epoch::pin();
-        let mut node: Node<u32, u32> = Node::with_capacity(10);
+        let node: Node<u32, u32> = Node::with_capacity(10);
         node.insert(1, 1, &guard).unwrap();
         node.insert(2, 2, &guard).unwrap();
         node.insert(3, 3, &guard).unwrap();
@@ -2032,7 +1753,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        let mut node = Node::init_with_capacity(vec, 4);
+        let node = Node::init_with_capacity(vec, 4);
 
         node.insert(4, 4, &guard).unwrap();
 
@@ -2056,7 +1777,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        let mut node = Node::init_with_capacity(vec, 4);
+        let node = Node::init_with_capacity(vec, 4);
 
         node.insert(4, 4, &guard).unwrap();
 
@@ -2077,7 +1798,7 @@ mod tests {
     fn min() {
         let guard = crossbeam_epoch::pin();
         let sorted: Vec<(u32, u32)> = vec![(1, 1), (3, 3), (4, 4), (5, 5)];
-        let mut node: Node<u32, u32> =
+        let node: Node<u32, u32> =
             Node::init_with_capacity(sorted.clone(), (sorted.len() * 2) as u16);
 
         assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 1 ));
@@ -2095,7 +1816,7 @@ mod tests {
     fn max() {
         let guard = crossbeam_epoch::pin();
         let sorted: Vec<(u32, u32)> = vec![(1, 1), (3, 3), (4, 4), (5, 5)];
-        let mut node: Node<u32, u32> =
+        let node: Node<u32, u32> =
             Node::init_with_capacity(sorted.clone(), (sorted.len() * 2) as u16);
 
         assert!(matches!(node.last_kv(&guard), Some((k, _)) if *k == 5 ));
@@ -2131,7 +1852,7 @@ mod tests {
 
     #[cfg(test)]
     mod metadata_tests {
-        use crate::node::Metadata;
+        use crate::node::metadata::Metadata;
 
         #[test]
         fn create_reserved_metadata() {
