@@ -1671,30 +1671,6 @@ mod tests {
     }
 
     #[test]
-    fn peek_next() {
-        let guard = crossbeam_epoch::pin();
-        let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)]
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        let node = Node::init_with_capacity(vec, 4);
-
-        node.insert(4, 4, &guard).unwrap();
-
-        let mut iter = node.iter(&guard);
-        assert!(matches!(iter.peek_next(), Some((k, _)) if *k == 1));
-        iter.next();
-        assert!(matches!(iter.peek_next(), Some((k, _)) if *k == 2));
-        iter.next();
-        assert!(matches!(iter.peek_next(), Some((k, _)) if *k == 3));
-        iter.next();
-        assert!(matches!(iter.peek_next(), Some((k, _)) if *k == 4));
-        iter.next();
-        assert_eq!(iter.len(), 0);
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
     fn peek_next_back() {
         let guard = crossbeam_epoch::pin();
         let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)]
@@ -1716,24 +1692,6 @@ mod tests {
         iter.next_back();
         assert_eq!(iter.len(), 0);
         assert!(iter.next().is_none());
-    }
-
-    #[test]
-    fn min() {
-        let guard = crossbeam_epoch::pin();
-        let sorted: Vec<(u32, u32)> = vec![(1, 1), (3, 3), (4, 4), (5, 5)];
-        let node: Node<u32, u32> =
-            Node::init_with_capacity(sorted.clone(), (sorted.len() * 2) as u16);
-
-        assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 1 ));
-
-        node.insert(0, 0, &guard).unwrap();
-        assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 0 ));
-
-        node.delete(&0, &guard).unwrap();
-        assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 1 ));
-        node.delete(&1, &guard).unwrap();
-        assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 3 ));
     }
 
     #[test]

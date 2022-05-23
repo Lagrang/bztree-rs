@@ -34,8 +34,6 @@
 //! assert!(matches!(tree.get(&key2, &guard), None));
 //! ```
 
-extern crate core;
-
 mod node;
 mod scanner;
 
@@ -46,6 +44,7 @@ use crossbeam_epoch::Guard;
 use mwcas::{HeapPointer, MwCas};
 use node::status_word::StatusWord;
 use std::borrow::Borrow;
+use std::fmt::Debug;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::option::Option::Some;
 use std::ptr;
@@ -1704,13 +1703,14 @@ impl<'a, K: Ord, V> Parent<'a, K, V> {
 
 #[cfg(test)]
 mod tests {
+    use rand::{thread_rng, Rng};
     use std::borrow::Borrow;
     use std::fmt::{Debug, Display, Formatter};
 
     use crate::BzTree;
 
     #[test]
-    fn insert() {
+    fn insert_min_sized_node() {
         let tree = BzTree::with_node_size(2);
         tree.insert(Key::new("1"), "1", &crossbeam_epoch::pin());
         tree.insert(Key::new("2"), "2", &crossbeam_epoch::pin());
@@ -1720,10 +1720,57 @@ mod tests {
         assert!(matches!(tree.get(&"1", &guard), Some(&"1")));
         assert!(matches!(tree.get(&"2", &guard), Some(&"2")));
         assert!(matches!(tree.get(&"3", &guard), Some(&"3")));
+
+        let tree = BzTree::with_node_size(2);
+        tree.insert(Key::new("1"), "1", &crossbeam_epoch::pin());
+        tree.insert(Key::new("2"), "2", &crossbeam_epoch::pin());
+
+        let guard = crossbeam_epoch::pin();
+        assert!(matches!(tree.get(&"1", &guard), Some(&"1")));
+        assert!(matches!(tree.get(&"2", &guard), Some(&"2")));
+        assert!(matches!(tree.iter(&guard).count(), 2));
     }
 
     #[test]
-    fn upsert() {
+    fn insert_full_nodess() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+
+                    assert!(matches!(
+                        tree.get(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.get(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upsert_min_sized_node() {
         let tree = BzTree::with_node_size(2);
         tree.upsert(Key::new("1"), "1", &crossbeam_epoch::pin());
         tree.upsert(Key::new("2"), "2", &crossbeam_epoch::pin());
@@ -1733,25 +1780,240 @@ mod tests {
         assert!(matches!(tree.get(&"1", &guard), Some(&"1")));
         assert!(matches!(tree.get(&"2", &guard), Some(&"2")));
         assert!(matches!(tree.get(&"3", &guard), Some(&"3")));
+
+        let tree = BzTree::with_node_size(2);
+        tree.upsert(Key::new("1"), "1", &crossbeam_epoch::pin());
+        tree.upsert(Key::new("2"), "2", &crossbeam_epoch::pin());
+
+        let guard = crossbeam_epoch::pin();
+        assert!(matches!(tree.get(&"1", &guard), Some(&"1")));
+        assert!(matches!(tree.get(&"2", &guard), Some(&"2")));
+        assert!(matches!(tree.iter(&guard).count(), 2));
     }
 
     #[test]
-    fn delete() {
-        let tree = BzTree::with_node_size(2);
-        tree.insert(Key::new("1"), "1", &crossbeam_epoch::pin());
-        tree.insert(Key::new("2"), "2", &crossbeam_epoch::pin());
-        tree.insert(Key::new("3"), "3", &crossbeam_epoch::pin());
+    fn upsert_full_nodess() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.upsert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
 
-        let guard = crossbeam_epoch::pin();
-        assert!(matches!(tree.delete(&"1", &guard), Some(&"1")));
-        assert!(matches!(tree.delete(&"2", &guard), Some(&"2")));
-        assert!(matches!(tree.delete(&"3", &guard), Some(&"3")));
+                    assert!(matches!(
+                        tree.get(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
 
-        assert!(tree.iter(&guard).next().is_none());
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.get(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+            }
+        }
+    }
 
-        assert!(tree.get(&"1", &guard).is_none());
-        assert!(tree.get(&"2", &guard).is_none());
-        assert!(tree.get(&"3", &guard).is_none());
+    #[test]
+    fn forward_delete() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                }
+
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn backward_delete() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                }
+
+                for i in (0..size * i).rev() {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn delete_from_midpoint() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                }
+
+                let vec = (0..(size * i) as usize).collect::<Vec<usize>>();
+                let (left, right) = vec.split_at((size * i / 2) as usize);
+
+                let mut left_iter = left.iter().rev();
+                let mut right_iter = right.iter().rev();
+                loop {
+                    let next = if thread_rng().gen_bool(0.5) {
+                        left_iter.next().or_else(|| right_iter.next())
+                    } else {
+                        right_iter.next().or_else(|| left_iter.next())
+                    };
+                    if next.is_none() {
+                        break;
+                    }
+
+                    let i = next.unwrap();
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn delete_to_midpoint() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                }
+
+                let vec = (0..(size * i) as usize).collect::<Vec<usize>>();
+                let (left, right) = vec.split_at((size * i / 2) as usize);
+
+                let mut left_iter = left.iter();
+                let mut right_iter = right.iter();
+                loop {
+                    let next = if thread_rng().gen_bool(0.5) {
+                        left_iter.next().or_else(|| right_iter.next())
+                    } else {
+                        right_iter.next().or_else(|| left_iter.next())
+                    };
+                    if next.is_none() {
+                        break;
+                    }
+
+                    let i = next.unwrap();
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+            }
+        }
     }
 
     #[test]
@@ -2117,114 +2379,155 @@ mod tests {
 
     #[test]
     fn first() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        tree.insert(Key::new("1"), "1", &guard);
-        tree.insert(Key::new("2"), "2", &guard);
-        tree.insert(Key::new("3"), "3", &guard);
-        tree.insert(Key::new("4"), "4", &guard);
-        tree.insert(Key::new("5"), "5", &guard);
-        tree.insert(Key::new("6"), "6", &guard);
-        tree.insert(Key::new("7"), "7", &guard);
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            tree.insert(Key::new("1"), "1", &guard);
+            tree.insert(Key::new("2"), "2", &guard);
+            tree.insert(Key::new("3"), "3", &guard);
+            tree.insert(Key::new("4"), "4", &guard);
+            tree.insert(Key::new("5"), "5", &guard);
+            tree.insert(Key::new("6"), "6", &guard);
+            tree.insert(Key::new("7"), "7", &guard);
 
-        assert!(matches!(tree.first(&guard), Some((k, _)) if k == &Key::new("1")));
+            assert!(matches!(tree.first(&guard), Some((k, _)) if k == &Key::new("1")));
 
-        tree.delete(&"1", &guard);
-        tree.delete(&"2", &guard);
-        tree.delete(&"3", &guard);
+            tree.delete(&"1", &guard);
+            tree.delete(&"2", &guard);
+            tree.delete(&"3", &guard);
 
-        assert!(matches!(tree.first(&guard), Some((k, _)) if k == &Key::new("4")));
+            assert!(matches!(tree.first(&guard), Some((k, _)) if k == &Key::new("4")));
+        }
     }
 
     #[test]
     fn last() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        tree.insert(Key::new("1"), "1", &guard);
-        tree.insert(Key::new("2"), "2", &guard);
-        tree.insert(Key::new("3"), "3", &guard);
-        tree.insert(Key::new("4"), "4", &guard);
-        tree.insert(Key::new("5"), "5", &guard);
-        tree.insert(Key::new("6"), "6", &guard);
-        tree.insert(Key::new("7"), "7", &guard);
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            tree.insert(Key::new("1"), "1", &guard);
+            tree.insert(Key::new("2"), "2", &guard);
+            tree.insert(Key::new("3"), "3", &guard);
+            tree.insert(Key::new("4"), "4", &guard);
+            tree.insert(Key::new("5"), "5", &guard);
+            tree.insert(Key::new("6"), "6", &guard);
+            tree.insert(Key::new("7"), "7", &guard);
 
-        assert!(matches!(tree.last(&guard), Some((k, _)) if k == &Key::new("7")));
+            assert!(matches!(tree.last(&guard), Some((k, _)) if k == &Key::new("7")));
 
-        tree.delete(&"5", &guard);
-        tree.delete(&"6", &guard);
-        tree.delete(&"7", &guard);
+            tree.delete(&"5", &guard);
+            tree.delete(&"6", &guard);
+            tree.delete(&"7", &guard);
 
-        assert!(matches!(tree.last(&guard), Some((k, _)) if k == &Key::new("4")));
+            assert!(matches!(tree.last(&guard), Some((k, _)) if k == &Key::new("4")));
+        }
     }
 
     #[test]
     fn pop_first() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        let count = 55;
-        for i in 0..count {
-            tree.insert(Key::new(i), i, &guard);
-        }
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            let count = size * thread_rng().gen_range(1..5) + thread_rng().gen_range(0..size);
+            for i in 0..count {
+                tree.insert(Key::new(i), i, &guard);
+            }
 
-        for i in 0..count {
-            println!("{i}");
-            assert!(matches!(tree.pop_first(&guard), Some((k, _)) if k == Key::new(i)));
-        }
+            for i in 0..count {
+                assert!(matches!(tree.pop_first(&guard), Some((k, _)) if k == Key::new(i)));
+            }
 
-        assert!(tree.iter(&guard).next().is_none());
+            assert!(tree.iter(&guard).next().is_none());
+        }
     }
 
     #[test]
     fn pop_last() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        let count = 55;
-        for i in 0..count {
-            tree.insert(Key::new(i), i, &guard);
-        }
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            let count = size * thread_rng().gen_range(1..5) + thread_rng().gen_range(0..size);
+            for i in 0..count {
+                tree.insert(Key::new(i), i, &guard);
+            }
 
-        for i in (0..count).rev() {
-            assert!(matches!(tree.pop_last(&guard), Some((k, _)) if k == Key::new(i)));
-        }
+            for i in (0..count).rev() {
+                assert!(matches!(tree.pop_last(&guard), Some((k, _)) if k == Key::new(i)));
+            }
 
-        assert!(tree.iter(&guard).next().is_none());
+            assert!(tree.iter(&guard).next().is_none());
+        }
     }
 
     #[test]
     fn conditional_insert() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        let count = 55;
-        for i in 0..count {
-            tree.insert(Key::new(i), i, &guard);
-        }
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            let count = size * thread_rng().gen_range(1..5) + thread_rng().gen_range(0..size);
+            for i in 0..count {
+                tree.insert(Key::new(i), i, &guard);
+            }
 
-        for i in 0..count {
-            assert!(tree.compute(&i, |(_, v)| Some(v + 1), &guard));
-        }
+            for i in 0..count {
+                assert!(tree.compute(&i, |(_, v)| Some(v + 1), &guard));
+            }
 
-        for i in 0..count {
-            assert_eq!(*tree.get(&i, &guard).unwrap(), i + 1);
-        }
+            for i in 0..count {
+                assert_eq!(*tree.get(&i, &guard).unwrap(), i + 1);
+            }
 
-        assert!(!tree.compute(&(count + 1), |(_, v)| Some(v + 1), &guard));
+            assert!(!tree.compute(&(count + 1), |(_, v)| Some(v + 1), &guard));
+        }
     }
 
     #[test]
     fn conditional_remove() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        let count = 55;
-        for i in 0..count {
-            tree.insert(Key::new(i), i, &guard);
-        }
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            let count = size * thread_rng().gen_range(1..5) + thread_rng().gen_range(0..size);
+            for i in 0..count {
+                tree.insert(Key::new(i), i, &guard);
+            }
 
-        for i in 0..count {
-            assert!(tree.compute(&i, |(_, _)| None, &guard));
-        }
+            for i in 0..count {
+                assert!(tree.compute(&i, |(_, _)| None, &guard));
+            }
 
-        for i in 0..count {
-            assert!(matches!(tree.get(&i, &guard), None));
+            for i in 0..count {
+                assert!(matches!(tree.get(&i, &guard), None));
+            }
         }
     }
 

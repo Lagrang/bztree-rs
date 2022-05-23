@@ -62,12 +62,6 @@ fn fill(tree: &BzTree<Key<usize>, String>, size: usize) -> Vec<(Key<usize>, Stri
     expected_items
 }
 
-//TODO: add test which will fill the tree and then pop all elements
-//TODO: add test which will fill the tree and then remove all elements
-//TODO: add test which will mix all operations
-//TODO: add tests which will create different patterns of inserts/deleted: inserts at beginning,
-// at the end, remove from the end, insert again into the end and so on.
-
 #[test]
 fn sequential_key_insert() {
     let node_size: usize = thread_rng().gen_range(50..100);
@@ -212,9 +206,9 @@ fn deletes_starting_from_tree_end() {
     let tree_levels = 3;
     let size = node_size.pow(tree_levels);
     println!("Node size: {:?}", node_size);
-    let mut tree = BzTree::with_node_size(node_size as u16);
+    let tree = BzTree::with_node_size(node_size as u16);
     for _ in 0..2 {
-        let expected_items = fill(&mut tree, size);
+        let expected_items = fill(&tree, size);
         for (key, value) in expected_items.iter().rev() {
             let key: &usize = key.borrow();
             let guard = &crossbeam_epoch::pin();
@@ -546,14 +540,14 @@ fn check_scanners(
     let guard = crossbeam_epoch::pin();
     let prob = 0.35;
     if thread_rng().gen_bool(prob) {
-        History::from(&last_state).run_scanner_check(|| (.., false, Box::new(tree.iter(&guard))));
+        History::from(last_state).run_scanner_check(|| (.., false, Box::new(tree.iter(&guard))));
     } else if thread_rng().gen_bool(prob) {
         // right edge check
-        History::from(&last_state).run_scanner_check(|| {
+        History::from(last_state).run_scanner_check(|| {
             let range = ..greatest_key.clone();
             (range.clone(), false, Box::new(tree.range(range, &guard)))
         });
-        History::from(&last_state).run_scanner_check(|| {
+        History::from(last_state).run_scanner_check(|| {
             let range = ..=greatest_key.clone();
             (range.clone(), false, Box::new(tree.range(range, &guard)))
         });
@@ -571,11 +565,11 @@ fn check_scanners(
         } else {
             Key::new((key_val as i64 + sign) as u64)
         };
-        History::from(&last_state).run_scanner_check(|| {
+        History::from(last_state).run_scanner_check(|| {
             let range = ..=edge.clone();
             (range.clone(), false, Box::new(tree.range(range, &guard)))
         });
-        History::from(&last_state).run_scanner_check(|| {
+        History::from(last_state).run_scanner_check(|| {
             let range = ..edge.clone();
             (range.clone(), false, Box::new(tree.range(range, &guard)))
         });
@@ -583,7 +577,7 @@ fn check_scanners(
         // left edge check with custom value
         let key_val: u64 = *greatest_key.borrow();
         let edge = thread_rng().gen_range(0..key_val + 1);
-        History::from(&last_state).run_scanner_check(|| {
+        History::from(last_state).run_scanner_check(|| {
             let range = Key::new(edge)..;
             (range.clone(), false, Box::new(tree.range(range, &guard)))
         });
@@ -591,18 +585,24 @@ fn check_scanners(
         let left_edge = thread_rng().gen_range(0..key_val + 1);
         let right_edge = thread_rng().gen_range(left_edge as u64..key_val + 1);
         if thread_rng().gen_bool(prob) {
-            History::from(&last_state).run_scanner_check(|| {
+            History::from(last_state).run_scanner_check(|| {
                 let range = Key::new(left_edge)..Key::new(right_edge);
                 (range.clone(), false, Box::new(tree.range(range, &guard)))
             });
         } else {
-            History::from(&last_state).run_scanner_check(|| {
+            History::from(last_state).run_scanner_check(|| {
                 let range = Key::new(left_edge)..=Key::new(right_edge);
                 (range.clone(), false, Box::new(tree.range(range, &guard)))
             });
         }
     }
 }
+
+//TODO: add test which will fill the tree and then pop all elements
+//TODO: add test which will fill the tree and then remove all elements
+//TODO: add test which will mix all operations
+//TODO: add tests which will create different patterns of inserts/deleted: inserts at beginning,
+// at the end, remove from the end, insert again into the end and so on.
 
 #[derive(Debug)]
 struct Droppable {
