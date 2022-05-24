@@ -1546,8 +1546,8 @@ unsafe impl<K: Ord, V> Send for NodePointer<K, V> {}
 
 unsafe impl<K: Ord, V> Sync for NodePointer<K, V> {}
 
-impl<K: Ord, V> From<InterimNodeRef<K, V>> for NodePointer<K, V> {
-    fn from(node: InterimNodeRef<K, V>) -> Self {
+impl<K: Ord, V> From<ArcInterimNode<K, V>> for NodePointer<K, V> {
+    fn from(node: ArcInterimNode<K, V>) -> Self {
         Interim(node)
     }
 }
@@ -1555,13 +1555,13 @@ impl<K: Ord, V> From<InterimNodeRef<K, V>> for NodePointer<K, V> {
 impl<K: Ord, V> NodePointer<K, V> {
     #[inline]
     fn new_leaf(node: LeafNode<K, V>) -> NodePointer<K, V> {
-        let leaf_node = LeafNodeRef::new(node);
+        let leaf_node = ArcLeafNode::new(node);
         Leaf(leaf_node)
     }
 
     #[inline]
     fn new_interim(node: InterimNode<K, V>) -> NodePointer<K, V> {
-        let interim_node = InterimNodeRef::new(node);
+        let interim_node = ArcInterimNode::new(node);
         Interim(interim_node)
     }
 
