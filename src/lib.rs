@@ -639,9 +639,6 @@ where
             return MergeResult::Retry;
         }
 
-        let mut drop = NodeDrop::new();
-        drop.add(path.node_pointer.clone());
-
         // if no siblings in parent node
         if parent.node().estimated_len(guard) <= 1 {
             path.node_pointer.try_unfroze();
@@ -654,7 +651,7 @@ where
                         node_pointer: parent.node_pointer,
                         cas_pointer: parent.cas_pointer,
                     },
-                    drop,
+                    NodeDrop::new(),
                     guard,
                 )
             } else {
@@ -669,6 +666,7 @@ where
             };
         }
 
+        let mut drop = NodeDrop::new();
         let mut mwcas = MwCas::new();
         // merge underflow node with one of its siblings
         let merge_res = self.merge_with_sibling(
@@ -690,7 +688,6 @@ where
         // check that parent node is also underflow and should be merged on it's own level
         let new_parent_should_merge = self.should_merge(new_parent.estimated_len(guard));
 
-        drop.add(parent.node_pointer.clone());
         mwcas.compare_exchange(
             parent.node().status_word(),
             parent_status,
@@ -727,6 +724,8 @@ where
             // we successfully merge node, now check is it parent become underutilized.
             // we try to merge parent only after original node merged, this will provide
             // bottom-up merge until we reach root.
+            drop.add(path.node_pointer.clone());
+            drop.add(parent.node_pointer.clone());
             drop.exec(guard);
             if new_parent_should_merge {
                 let new_parent_ptr = parent.cas_pointer.read(guard);
