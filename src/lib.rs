@@ -759,6 +759,7 @@ where
             return MergeResult::Retry;
         }
 
+        drop.add(empty_node_path.node_pointer.clone());
         mwcas.compare_exchange(
             empty_node_path.node_pointer.status_word(),
             node_status,
@@ -833,7 +834,6 @@ where
         }
 
         if mwcas.exec(guard) {
-            drop.add(empty_node_path.node_pointer.clone());
             drop.exec(guard);
             MergeResult::Completed
         } else {
