@@ -181,13 +181,13 @@ impl<K: Ord, V> Node<K, V> {
             .map(|(_, _, kv_index)| kv_index)
             .map_err(|_| DeleteError::KeyNotFound)?;
 
-        let new_status = status_word.delete_entry();
         let entry = &mut deref_mut!(self).data_block[index];
         let cur_metadata: Metadata = entry.metadata.read(guard).into();
         if !cur_metadata.is_visible() {
             return Err(DeleteError::Retry);
         }
 
+        let new_status = status_word.delete_entry();
         let mut mwcas = MwCas::new();
         mwcas.compare_exchange(&self.status_word, status_word, new_status);
         mwcas.compare_exchange_u64(

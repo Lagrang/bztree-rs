@@ -249,6 +249,6 @@ pub fn single_threaded(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(conc, concurrent);
 criterion_group!(st, single_threaded);
+criterion_group!(conc, concurrent);
 criterion_main!(st, conc);

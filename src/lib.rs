@@ -1231,13 +1231,46 @@ where
         }
     }
 
+    /// Find leaf node which can contain passed key
+    fn find_leaf_for_key<'g, Q>(
+        &'g self,
+        search_key: &Key<Q>,
+        create_node_for_key: bool,
+        guard: &'g Guard,
+    ) -> Option<&'g LeafNode<K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + Clone,
+    {
+        let mut next_node: &NodeLink<K, V> = &self.root;
+        loop {
+            next_node = match next_node.read(guard) {
+                Interim(node) => {
+                    if let Some((_, child_node_ptr)) = node.closest(search_key, guard) {
+                        child_node_ptr
+                    } else if create_node_for_key {
+                        // slow path
+                        return self
+                            .find_path_to_key(search_key, create_node_for_key, guard)
+                            .map(|path| path.node_pointer.to_leaf_node());
+                    } else {
+                        return None;
+                    }
+                }
+                Leaf(node) => {
+                    return Some(node);
+                }
+            }
+        }
+    }
+
     /// Find leaf node(with traversal path from root) which can contain passed key.
     /// If no node exists which can contain passed key, it can be created using
     /// `create_pos_inf_node_if_not_exists` flag.
     fn find_path_to_key<'g, Q>(
         &'g self,
         search_key: &Key<Q>,
-        create_pos_inf_node_if_not_exists: bool,
+        create_node_for_key: bool,
         guard: &'g Guard,
     ) -> Option<TraversePath<'g, K, V>>
     where
@@ -1258,7 +1291,7 @@ where
                             child_key: child_node_key.clone(),
                         });
                         child_node_ptr
-                    } else if create_pos_inf_node_if_not_exists {
+                    } else if create_node_for_key {
                         // No place found for the key, we need to grow the tree.
                         // Greatest element of interim node will serve as +Inf node to
                         // accommodate new KV.
@@ -1330,21 +1363,6 @@ where
         }
 
         mwcas.exec(guard)
-    }
-
-    /// Find leaf node which can contain passed key
-    fn find_leaf_for_key<'g, Q>(
-        &'g self,
-        search_key: &Key<Q>,
-        create_if_not_exists: bool,
-        guard: &'g Guard,
-    ) -> Option<&'g LeafNode<K, V>>
-    where
-        K: Borrow<Q>,
-        Q: Ord + Clone,
-    {
-        self.find_path_to_key(search_key, create_if_not_exists, guard)
-            .map(|path| path.node_pointer.to_leaf_node())
     }
 
     /// Return leaf node which contains max known key of the tree. Also return key in parent node
