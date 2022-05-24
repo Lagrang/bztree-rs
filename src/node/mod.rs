@@ -493,7 +493,7 @@ impl<K: Ord, V> Node<K, V> {
             "Node must be frozen before split"
         );
 
-        let mut kvs: Vec<(K, V)> = self.clone_all_kv(guard);
+        let mut kvs: Vec<(K, V)> = self.clone_content(guard);
         let capacity = self.capacity() as u16;
         if kvs.len() < capacity as usize {
             // node contains too many updates/deletes which cause split
@@ -518,7 +518,7 @@ impl<K: Ord, V> Node<K, V> {
             "Node must be frozen before split"
         );
 
-        let mut kvs: Vec<(K, V)> = self.clone_all_kv(guard);
+        let mut kvs: Vec<(K, V)> = self.clone_content(guard);
         let split_point = kvs.len() / 2;
         let left = Self::new_readonly(kvs.drain(..split_point).collect());
         let right = Self::new_readonly(kvs);
@@ -631,6 +631,30 @@ impl<K: Ord, V> Node<K, V> {
         MergeMode::NewNode(Self::new_readonly(sorted_kvs))
     }
 
+    /// Clone all KVs of this node.
+    pub fn clone_content<'g>(&'g self, guard: &'g Guard) -> Vec<(K, V)>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        self.iter(guard)
+            .map(|(key, val)| (key.clone(), val.clone()))
+            .collect()
+    }
+
+    /// Clone KVs of this node which pass the filter.
+    pub fn clone_with_filter<'g, F>(&'g self, filter: F, guard: &'g Guard) -> Vec<(K, V)>
+    where
+        K: Clone,
+        V: Clone,
+        F: FnMut(&(&K, &V)) -> bool,
+    {
+        self.iter(guard)
+            .filter(filter)
+            .map(|(key, val)| (key.clone(), val.clone()))
+            .collect()
+    }
+
     #[inline(always)]
     pub fn capacity(&self) -> usize {
         self.data_block.len()
@@ -683,16 +707,6 @@ impl<K: Ord, V> Node<K, V> {
         let mut mwcas = MwCas::new();
         mwcas.compare_exchange(&self.status_word, cur_status, cur_status.unfroze());
         mwcas.exec(guard)
-    }
-
-    fn clone_all_kv(&self, guard: &Guard) -> Vec<(K, V)>
-    where
-        K: Clone + Ord,
-        V: Clone,
-    {
-        self.iter(guard)
-            .map(|(k, v)| ((*k).clone(), (*v).clone()))
-            .collect()
     }
 
     fn get_internal<'g, Q>(
@@ -945,6 +959,10 @@ impl<K: Ord, V> Drop for Node<K, V> {
         // node removed from tree structure and all threads which
         // perform tree scan already completed.
         let guard = unsafe { crossbeam_epoch::unprotected() };
+        // this set tracks upserts which drops previous value of key.
+        // if we already saw the key, that indicates that current entry points to original value
+        // which was replaced by upsert. Such value already dropped during upsert operation and
+        // should be skipped here.
         let mut already_scanned = BTreeSet::new();
         for entry in self.data_block.drain(..).rev() {
             let metadata: Metadata = entry.metadata.read(guard).into();

@@ -798,16 +798,7 @@ where
 
             // create copy of parent node without link to empty child
             let new_node = InterimNode::new_readonly(
-                parent_node
-                    .iter(guard)
-                    .filter_map(|(k, v)| {
-                        if k != &parent_handle.child_key {
-                            Some((k.clone(), v.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
+                parent_node.clone_with_filter(|(k, _)| *k != &parent_handle.child_key, guard),
             );
 
             mwcas.compare_exchange(
@@ -947,21 +938,21 @@ where
             return Err(MergeResult::Completed);
         }
 
-        let (merged_key, merged_node_ptr) = merged.unwrap();
+        let (new_node_key, new_node_ptr) = merged.unwrap();
         let merged_sibling_key = merged_sibling_key.unwrap();
         // create new parent node with merged node and without empty/merged siblings.
         let mut buffer = Vec::with_capacity(parent.node().estimated_len(guard) - 1);
         let merged_node_key = &parent.child_key;
-        for (key, val) in parent.node().iter(guard) {
-            if key == merged_node_key {
+        for (key, val) in parent.node().clone_content(guard) {
+            if &key == merged_node_key {
                 // replace underutilized node by merged one
                 buffer.push((
-                    (*merged_key).clone(),
-                    HeapPointer::new(merged_node_ptr.clone()),
+                    (*new_node_key).clone(),
+                    HeapPointer::new(new_node_ptr.clone()),
                 ));
-            } else if key != merged_sibling_key {
-                // remove merged sibling
-                buffer.push((key.clone(), HeapPointer::new(val.read(guard).clone())));
+            } else if &key != merged_sibling_key {
+                // remove merged sibling from parent node
+                buffer.push((key, val));
             }
         }
         Ok(InterimNode::new_readonly(buffer))
@@ -1161,16 +1152,16 @@ where
             }
 
             let mut sorted_elems = Vec::with_capacity(node_len + 1);
-            for (key, val) in parent_node.iter(guard) {
+            for (key, val) in parent_node.clone_content(guard) {
                 // overflowed node found inside parent, replace it by 2 new nodes
-                if underflow_node_key == key {
+                if underflow_node_key == &key {
                     sorted_elems.push((left_key.clone(), HeapPointer::new(left_child.clone())));
                     sorted_elems.push((
                         underflow_node_key.clone(),
                         HeapPointer::new(right_child.clone()),
                     ));
                 } else {
-                    sorted_elems.push((key.clone(), val.clone()));
+                    sorted_elems.push((key, val));
                 }
             }
 
@@ -1348,12 +1339,9 @@ where
                 status_word.inc_version(),
             );
 
-            let mut elems: Vec<(Key<K>, NodeLink<K, V>)> = node
-                .iter(guard)
-                .map(|(key, val)| (key.clone(), val.clone()))
-                .collect();
-            elems.last_mut().unwrap().0 = Key::pos_infinite();
-            let new_interim = InterimNode::new_readonly(elems);
+            let mut cloned_kvs = node.clone_content(guard);
+            cloned_kvs.last_mut().unwrap().0 = Key::pos_infinite();
+            let new_interim = InterimNode::new_readonly(cloned_kvs);
             // update link in parent node to new interim node
             mwcas.compare_exchange(
                 interim.cas_pointer,
@@ -1558,8 +1546,8 @@ unsafe impl<K: Ord, V> Send for NodePointer<K, V> {}
 
 unsafe impl<K: Ord, V> Sync for NodePointer<K, V> {}
 
-impl<K: Ord, V> From<ArcInterimNode<K, V>> for NodePointer<K, V> {
-    fn from(node: ArcInterimNode<K, V>) -> Self {
+impl<K: Ord, V> From<InterimNodeRef<K, V>> for NodePointer<K, V> {
+    fn from(node: InterimNodeRef<K, V>) -> Self {
         Interim(node)
     }
 }
@@ -1567,13 +1555,13 @@ impl<K: Ord, V> From<ArcInterimNode<K, V>> for NodePointer<K, V> {
 impl<K: Ord, V> NodePointer<K, V> {
     #[inline]
     fn new_leaf(node: LeafNode<K, V>) -> NodePointer<K, V> {
-        let leaf_node = ArcLeafNode::new(node);
+        let leaf_node = LeafNodeRef::new(node);
         Leaf(leaf_node)
     }
 
     #[inline]
     fn new_interim(node: InterimNode<K, V>) -> NodePointer<K, V> {
-        let interim_node = ArcInterimNode::new(node);
+        let interim_node = InterimNodeRef::new(node);
         Interim(interim_node)
     }
 
