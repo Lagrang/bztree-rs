@@ -48,7 +48,6 @@ use std::fmt::Debug;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::option::Option::Some;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// BzTree data structure.
 ///
@@ -605,7 +604,8 @@ where
         // obtain direct parent of merging node
         let parent = path.parents.pop();
         if parent.is_none() {
-            return self.merge_root(path.node_pointer, guard);
+            let result = self.merge_root(path.node_pointer, guard);
+            return result;
         }
 
         // freeze underflow node to ensure that no one can modify it
@@ -639,6 +639,9 @@ where
             return MergeResult::Retry;
         }
 
+        let mut drop = NodeDrop::new();
+        drop.add(path.node_pointer.clone());
+
         // if no siblings in parent node
         if parent.node().estimated_len(guard) <= 1 {
             path.node_pointer.try_unfroze();
@@ -651,6 +654,7 @@ where
                         node_pointer: parent.node_pointer,
                         cas_pointer: parent.cas_pointer,
                     },
+                    drop,
                     guard,
                 )
             } else {
@@ -667,8 +671,14 @@ where
 
         let mut mwcas = MwCas::new();
         // merge underflow node with one of its siblings
-        let merge_res =
-            self.merge_with_sibling(path.node_pointer, &parent, parent_status, &mut mwcas, guard);
+        let merge_res = self.merge_with_sibling(
+            path.node_pointer,
+            &parent,
+            parent_status,
+            &mut mwcas,
+            &mut drop,
+            guard,
+        );
         let new_parent = match merge_res {
             Ok(new_parent) => new_parent,
             Err(e) => {
@@ -680,6 +690,7 @@ where
         // check that parent node is also underflow and should be merged on it's own level
         let new_parent_should_merge = self.should_merge(new_parent.estimated_len(guard));
 
+        drop.add(parent.node_pointer.clone());
         mwcas.compare_exchange(
             parent.node().status_word(),
             parent_status,
@@ -716,6 +727,7 @@ where
             // we successfully merge node, now check is it parent become underutilized.
             // we try to merge parent only after original node merged, this will provide
             // bottom-up merge until we reach root.
+            drop.exec(guard);
             if new_parent_should_merge {
                 let new_parent_ptr = parent.cas_pointer.read(guard);
                 return MergeResult::RecursiveMerge(TraversePath {
@@ -739,6 +751,7 @@ where
     fn remove_empty_parent(
         &self,
         mut empty_node_path: TraversePath<K, V>,
+        mut drop: NodeDrop<K, V>,
         guard: &Guard,
     ) -> MergeResult<K, V> {
         let mut mwcas = MwCas::new();
@@ -746,6 +759,7 @@ where
         if node_status.is_frozen() {
             return MergeResult::Retry;
         }
+
         mwcas.compare_exchange(
             empty_node_path.node_pointer.status_word(),
             node_status,
@@ -769,10 +783,12 @@ where
                         cas_pointer: parent_handle.cas_pointer,
                         node_pointer: parent_handle.node_pointer,
                     },
+                    drop,
                     guard,
                 );
             }
 
+            drop.add(parent_handle.node_pointer.clone());
             mwcas.compare_exchange(
                 parent_node.status_word(),
                 parent_status,
@@ -818,6 +834,8 @@ where
         }
 
         if mwcas.exec(guard) {
+            drop.add(empty_node_path.node_pointer.clone());
+            drop.exec(guard);
             MergeResult::Completed
         } else {
             MergeResult::Retry
@@ -829,23 +847,30 @@ where
         loop {
             if let Interim(root) = cur_root {
                 let root_status = root.status_word().read(guard);
+                if root_status.is_frozen() || root.estimated_len(guard) != 1 {
+                    break;
+                }
                 // if root contains only 1 node, move this node up to root level
-                if !root_status.is_frozen() && root.estimated_len(guard) == 1 {
-                    let (_, child_ptr) = root.iter(guard).next().unwrap();
-                    let child_node_pointer = child_ptr.read(guard);
-                    let child_status = child_node_pointer.status_word().read(guard);
-                    let mut mwcas = MwCas::new();
-                    mwcas.compare_exchange(root.status_word(), root_status, root_status.froze());
-                    mwcas.compare_exchange(
-                        child_node_pointer.status_word(),
-                        child_status,
-                        child_status.clone(),
-                    );
-                    mwcas.compare_exchange(&self.root, cur_root, child_node_pointer.clone());
-                    if !child_status.is_frozen() && mwcas.exec(guard) {
-                        cur_root = self.root.read(guard);
-                        continue;
-                    }
+                let (_, child_ptr) = root.iter(guard).next().unwrap();
+                let child_node_pointer = child_ptr.read(guard);
+                let child_status = child_node_pointer.status_word().read(guard);
+                if child_status.is_frozen() {
+                    break;
+                }
+                let mut mwcas = MwCas::new();
+                mwcas.compare_exchange(root.status_word(), root_status, root_status.froze());
+                mwcas.compare_exchange(
+                    child_node_pointer.status_word(),
+                    child_status,
+                    child_status.clone(),
+                );
+                mwcas.compare_exchange(&self.root, cur_root, child_node_pointer.clone());
+                if mwcas.exec(guard) {
+                    let mut drop = NodeDrop::new();
+                    drop.add(cur_root.clone());
+                    drop.exec(guard);
+                    cur_root = self.root.read(guard);
+                    continue;
                 }
             }
             break;
@@ -860,6 +885,7 @@ where
         parent: &'g Parent<'g, K, V>,
         parent_status: &StatusWord,
         mwcas: &mut MwCas<'g>,
+        drop: &mut NodeDrop<K, V>,
         guard: &'g Guard,
     ) -> Result<InterimNode<K, V>, MergeResult<K, V>> {
         let mut siblings: Vec<(&Key<K>, &NodePointer<K, V>)> = Vec::with_capacity(2);
@@ -898,6 +924,7 @@ where
                                 sibling_status,
                                 sibling_status.froze(),
                             );
+                            drop.add((*sibling).clone());
                             break;
                         }
                         MergeMode::MergeFailed => {}
@@ -923,6 +950,7 @@ where
                                     sibling_status,
                                     sibling_status.froze(),
                                 );
+                                drop.add((*sibling).clone());
                                 break;
                             }
                             MergeMode::MergeFailed => {}
@@ -1026,6 +1054,11 @@ where
                 mwcas.compare_exchange(parent.cas_pointer, parent.node_pointer, new_parent);
                 if !mwcas.exec(guard) {
                     path.node_pointer.try_unfroze();
+                } else {
+                    let mut drop = NodeDrop::new();
+                    drop.add(path.node_pointer.clone());
+                    drop.add(parent.node_pointer.clone());
+                    drop.exec(guard);
                 }
                 None
             }
@@ -1041,6 +1074,10 @@ where
                 mwcas.compare_exchange(path.cas_pointer, path.node_pointer, compacted_node);
                 if !mwcas.exec(guard) {
                     path.node_pointer.try_unfroze();
+                } else {
+                    let mut drop = NodeDrop::new();
+                    drop.add(path.node_pointer.clone());
+                    drop.exec(guard);
                 }
                 None
             }
@@ -1120,14 +1157,19 @@ where
 
         let mut mwcas = MwCas::new();
         mwcas.compare_exchange(&self.root, root, new_root);
-        let res = mwcas.exec(guard);
-        debug_assert!(res);
+        if mwcas.exec(guard) {
+            let mut drop = NodeDrop::new();
+            drop.add(root.clone());
+            drop.exec(guard);
+        } else {
+            debug_assert!(false);
+        }
     }
 
     fn try_split_node(
         &self,
         node: &NodePointer<K, V>,
-        underflow_node_key: &Key<K>,
+        overflow_node_key: &Key<K>,
         parent_node: &InterimNode<K, V>,
         guard: &Guard,
     ) -> SplitResult<K, V> {
@@ -1135,7 +1177,7 @@ where
         #[inline(always)]
         fn new_parent<K, V>(
             parent_node: &InterimNode<K, V>,
-            underflow_node_key: &Key<K>,
+            overflow_node_key: &Key<K>,
             left_key: Key<K>,
             left_child: NodePointer<K, V>,
             right_child: NodePointer<K, V>,
@@ -1154,10 +1196,10 @@ where
             let mut sorted_elems = Vec::with_capacity(node_len + 1);
             for (key, val) in parent_node.clone_content(guard) {
                 // overflowed node found inside parent, replace it by 2 new nodes
-                if underflow_node_key == &key {
+                if overflow_node_key == &key {
                     sorted_elems.push((left_key.clone(), HeapPointer::new(left_child.clone())));
                     sorted_elems.push((
-                        underflow_node_key.clone(),
+                        overflow_node_key.clone(),
                         HeapPointer::new(right_child.clone()),
                     ));
                 } else {
@@ -1178,7 +1220,7 @@ where
                         .clone();
                     if let Some(new_parent) = new_parent(
                         parent_node,
-                        underflow_node_key,
+                        overflow_node_key,
                         Key::new(left_key),
                         NodePointer::new_leaf(left),
                         NodePointer::new_leaf(right),
@@ -1203,7 +1245,7 @@ where
                         .clone();
                     if let Some(new_parent) = new_parent(
                         parent_node,
-                        underflow_node_key,
+                        overflow_node_key,
                         left_key,
                         NodePointer::new_interim(left),
                         NodePointer::new_interim(right),
@@ -1325,6 +1367,7 @@ where
         };
         path.parents.push(parent);
 
+        let mut drop = NodeDrop::new();
         // update key of greatest node to +Inf on all levels of tree
         let mut mwcas = MwCas::new();
         for interim in path.parents {
@@ -1343,6 +1386,7 @@ where
             cloned_kvs.last_mut().unwrap().0 = Key::pos_infinite();
             let new_interim = InterimNode::new_readonly(cloned_kvs);
             // update link in parent node to new interim node
+            drop.add(interim.node_pointer.clone());
             mwcas.compare_exchange(
                 interim.cas_pointer,
                 interim.node_pointer,
@@ -1350,7 +1394,12 @@ where
             );
         }
 
-        mwcas.exec(guard)
+        if mwcas.exec(guard) {
+            drop.exec(guard);
+            true
+        } else {
+            false
+        }
     }
 
     /// Return leaf node which contains max known key of the tree. Also return key in parent node
@@ -1414,21 +1463,29 @@ struct TraversePath<'g, K: Ord, V> {
     parents: Vec<Parent<'g, K, V>>,
 }
 
-struct ArcLeafNode<K: Ord, V> {
-    ref_cnt: *mut AtomicUsize,
+#[repr(transparent)]
+struct LeafNodeRef<K: Ord, V> {
     node: *mut LeafNode<K, V>,
 }
 
-impl<K: Ord, V> ArcLeafNode<K, V> {
+impl<K: Ord, V> LeafNodeRef<K, V> {
     fn new(leaf: LeafNode<K, V>) -> Self {
-        ArcLeafNode {
-            ref_cnt: Box::into_raw(Box::new(AtomicUsize::new(1))),
+        LeafNodeRef {
             node: Box::into_raw(Box::new(leaf)),
+        }
+    }
+
+    fn drop_manual(self, guard: &Guard) {
+        unsafe {
+            let node = Box::from_raw(self.node);
+            guard.defer_unchecked(move || {
+                drop(node);
+            });
         }
     }
 }
 
-impl<K: Ord, V> Deref for ArcLeafNode<K, V> {
+impl<K: Ord, V> Deref for LeafNodeRef<K, V> {
     type Target = LeafNode<K, V>;
 
     fn deref(&self) -> &Self::Target {
@@ -1436,56 +1493,44 @@ impl<K: Ord, V> Deref for ArcLeafNode<K, V> {
     }
 }
 
-impl<K: Ord, V> DerefMut for ArcLeafNode<K, V> {
+impl<K: Ord, V> DerefMut for LeafNodeRef<K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.node }
     }
 }
 
-impl<K: Ord, V> Clone for ArcLeafNode<K, V> {
+impl<K: Ord, V> Clone for LeafNodeRef<K, V> {
     fn clone(&self) -> Self {
-        unsafe {
-            let prev = (*self.ref_cnt).fetch_add(1, Ordering::AcqRel);
-            debug_assert!(prev > 0);
-        }
-        ArcLeafNode {
-            ref_cnt: self.ref_cnt,
-            node: self.node,
-        }
+        LeafNodeRef { node: self.node }
     }
 }
 
-impl<K: Ord, V> Drop for ArcLeafNode<K, V> {
-    fn drop(&mut self) {
-        unsafe {
-            let prev = (*self.ref_cnt).fetch_sub(1, Ordering::AcqRel);
-            if prev == 1 {
-                drop(Box::from_raw(self.ref_cnt));
-                drop(Box::from_raw(self.node));
-            }
-        }
-    }
-}
+unsafe impl<K: Ord, V> Send for LeafNodeRef<K, V> {}
+unsafe impl<K: Ord, V> Sync for LeafNodeRef<K, V> {}
 
-unsafe impl<K: Ord, V> Send for ArcLeafNode<K, V> {}
-
-unsafe impl<K: Ord, V> Sync for ArcLeafNode<K, V> {}
-
-struct ArcInterimNode<K: Ord, V> {
-    ref_cnt: *mut AtomicUsize,
+#[repr(transparent)]
+struct InterimNodeRef<K: Ord, V> {
     node: *mut InterimNode<K, V>,
 }
 
-impl<K: Ord, V> ArcInterimNode<K, V> {
+impl<K: Ord, V> InterimNodeRef<K, V> {
     fn new(interim: InterimNode<K, V>) -> Self {
-        ArcInterimNode {
-            ref_cnt: Box::into_raw(Box::new(AtomicUsize::new(1))),
+        InterimNodeRef {
             node: Box::into_raw(Box::new(interim)),
+        }
+    }
+
+    fn drop_manual(self, guard: &Guard) {
+        unsafe {
+            let node = Box::from_raw(self.node);
+            guard.defer_unchecked(move || {
+                drop(node);
+            });
         }
     }
 }
 
-impl<K: Ord, V> Deref for ArcInterimNode<K, V> {
+impl<K: Ord, V> Deref for InterimNodeRef<K, V> {
     type Target = InterimNode<K, V>;
 
     fn deref(&self) -> &Self::Target {
@@ -1493,44 +1538,49 @@ impl<K: Ord, V> Deref for ArcInterimNode<K, V> {
     }
 }
 
-impl<K: Ord, V> DerefMut for ArcInterimNode<K, V> {
+impl<K: Ord, V> DerefMut for InterimNodeRef<K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.node }
     }
 }
 
-impl<K: Ord, V> Clone for ArcInterimNode<K, V> {
+impl<K: Ord, V> Clone for InterimNodeRef<K, V> {
     fn clone(&self) -> Self {
-        unsafe {
-            let prev = (*self.ref_cnt).fetch_add(1, Ordering::AcqRel);
-            debug_assert!(prev > 0);
-        }
-        ArcInterimNode {
-            ref_cnt: self.ref_cnt,
-            node: self.node,
-        }
+        InterimNodeRef { node: self.node }
     }
 }
 
-impl<K: Ord, V> Drop for ArcInterimNode<K, V> {
-    fn drop(&mut self) {
-        unsafe {
-            let prev = (*self.ref_cnt).fetch_sub(1, Ordering::AcqRel);
-            if prev == 1 {
-                drop(Box::from_raw(self.ref_cnt));
-                drop(Box::from_raw(self.node));
+unsafe impl<K: Ord, V> Send for InterimNodeRef<K, V> {}
+unsafe impl<K: Ord, V> Sync for InterimNodeRef<K, V> {}
+
+struct NodeDrop<K: Ord, V> {
+    nodes: Vec<NodePointer<K, V>>,
+}
+
+impl<K: Ord, V> NodeDrop<K, V> {
+    fn new() -> Self {
+        NodeDrop {
+            nodes: Vec::with_capacity(2),
+        }
+    }
+
+    fn add(&mut self, node: NodePointer<K, V>) {
+        self.nodes.push(node);
+    }
+
+    fn exec(self, guard: &Guard) {
+        for node in self.nodes {
+            match node {
+                NodePointer::Interim(node) => node.drop_manual(guard),
+                NodePointer::Leaf(node) => node.drop_manual(guard),
             }
         }
     }
 }
 
-unsafe impl<K: Ord, V> Send for ArcInterimNode<K, V> {}
-
-unsafe impl<K: Ord, V> Sync for ArcInterimNode<K, V> {}
-
 enum NodePointer<K: Ord, V> {
-    Leaf(ArcLeafNode<K, V>),
-    Interim(ArcInterimNode<K, V>),
+    Leaf(LeafNodeRef<K, V>),
+    Interim(InterimNodeRef<K, V>),
 }
 
 impl<K: Ord, V> Clone for NodePointer<K, V> {
@@ -1546,8 +1596,8 @@ unsafe impl<K: Ord, V> Send for NodePointer<K, V> {}
 
 unsafe impl<K: Ord, V> Sync for NodePointer<K, V> {}
 
-impl<K: Ord, V> From<ArcInterimNode<K, V>> for NodePointer<K, V> {
-    fn from(node: ArcInterimNode<K, V>) -> Self {
+impl<K: Ord, V> From<InterimNodeRef<K, V>> for NodePointer<K, V> {
+    fn from(node: InterimNodeRef<K, V>) -> Self {
         Interim(node)
     }
 }
@@ -1555,13 +1605,13 @@ impl<K: Ord, V> From<ArcInterimNode<K, V>> for NodePointer<K, V> {
 impl<K: Ord, V> NodePointer<K, V> {
     #[inline]
     fn new_leaf(node: LeafNode<K, V>) -> NodePointer<K, V> {
-        let leaf_node = ArcLeafNode::new(node);
+        let leaf_node = LeafNodeRef::new(node);
         Leaf(leaf_node)
     }
 
     #[inline]
     fn new_interim(node: InterimNode<K, V>) -> NodePointer<K, V> {
-        let interim_node = ArcInterimNode::new(node);
+        let interim_node = InterimNodeRef::new(node);
         Interim(interim_node)
     }
 
