@@ -229,6 +229,9 @@ impl<K: Ord, V> Node<K, V> {
         let new_status = status_word.delete_entry();
         let entry = &mut deref_mut!(self).data_block[kv_index];
         let cur_metadata: Metadata = entry.metadata.read(guard).into();
+        if cur_metadata.is_deleted() {
+            return Err(DeleteError::KeyNotFound);
+        }
         if !cur_metadata.is_visible() {
             return Err(DeleteError::Retry);
         }
@@ -379,35 +382,44 @@ impl<K: Ord, V> Node<K, V> {
         K: Ord,
     {
         let status_word = self.status_word().read(guard);
+        self.conditional_edge_kv(edge, status_word, guard)
+    }
+
+    /// Find KV which placed on some of node's edge(e.g. min KV or max KV) at some point of time
+    /// (represented by status word).
+    pub fn conditional_edge_kv<'g>(
+        &'g self,
+        edge: NodeEdge,
+        status_word: &StatusWord,
+        guard: &'g Guard,
+    ) -> Option<EntryWithLoc<'g, K, V>>
+    where
+        K: Ord,
+    {
         let expected_ord = match edge {
             NodeEdge::Left => Ordering::Less,
             NodeEdge::Right => Ordering::Greater,
         };
 
         let mut unsorted_edge: Option<EntryWithLoc<K, V>> = None;
+        // do we have some KVs in unsorted part?
         if self.sorted_len < status_word.reserved_records() as usize {
-            // scan unsorted part first because it contain most recent values
             for index in self.sorted_len..status_word.reserved_records() as usize {
                 let entry = &self.data_block[index];
-                let metadata = loop {
-                    let metadata: Metadata = entry.metadata.read(guard).into();
-                    if !metadata.is_reserved() {
-                        break metadata;
-                    }
-                };
-
+                let metadata: Metadata = entry.metadata.read(guard).into();
                 if metadata.is_visible() {
                     let key = unsafe { entry.key() };
                     unsorted_edge = unsorted_edge
-                        .map(|max| {
-                            if key.cmp(max.key) == expected_ord {
+                        .map(|edge_kv| {
+                            debug_assert!(key != edge_kv.key);
+                            if key.cmp(edge_kv.key) == expected_ord {
                                 EntryWithLoc {
                                     location: index,
                                     key,
                                     value: unsafe { entry.value() },
                                 }
                             } else {
-                                max
+                                edge_kv
                             }
                         })
                         .or_else(|| {
@@ -466,6 +478,7 @@ impl<K: Ord, V> Node<K, V> {
             let sorted_key = sorted_edge.key;
             let unsorted_edge = unsorted_edge.unwrap();
             let unsorted_key = unsorted_edge.key;
+            debug_assert!(sorted_key != unsorted_key);
             if sorted_key.cmp(unsorted_key) == expected_ord {
                 Some(sorted_edge)
             } else {
@@ -800,7 +813,7 @@ impl<K: Ord, V> Node<K, V> {
                 if is_upsert {
                     self.try_reserve_entry(key, value, cur_status, false, guard)
                         .map(|mut reserved| {
-                            reserved.existing_entry = Some(index);
+                            reserved.overwritten_entry = Some(index);
                             reserved
                         })
                 } else {
@@ -837,7 +850,7 @@ impl<K: Ord, V> Node<K, V> {
                 self.get_internal(&new_entry.key, &new_entry.prev_status_word, true, guard)
             {
                 if is_upsert {
-                    new_entry.existing_entry = Some(index);
+                    new_entry.overwritten_entry = Some(index);
                 } else {
                     self.clear_reserved_entry(new_entry.index, guard);
                     return Err(InsertError::DuplicateKey);
@@ -884,19 +897,27 @@ impl<K: Ord, V> Node<K, V> {
                 reserved_metadata.into(),
                 Metadata::visible().into(),
             );
+            // mark existing KV as 'deleted' if it will be overwritten by upsert operation
+            if let Some(index) = new_entry.overwritten_entry {
+                let entry = &mut self_mut.data_block[index];
+                let metadata: Metadata = entry.metadata.read(guard).into();
+                // No need to check that metadata is still visible here.
+                // If someone already removed this existing entry, this will be catch by status
+                // word CAS.
+                mwcas.compare_exchange_u64(
+                    &entry.metadata,
+                    metadata.into(),
+                    Metadata::deleted().into(),
+                );
+            }
 
             if mwcas.exec(guard) {
-                return if let Some(index) = new_entry.existing_entry {
+                return if let Some(index) = new_entry.overwritten_entry {
+                    // drop value replaced by upsert
                     let entry = &mut self_mut.data_block[index];
-                    let metadata: Metadata = entry.metadata.read(guard).into();
-                    if metadata.is_visible() {
-                        unsafe {
-                            // drop value replaced by upsert
-                            entry.defer_value_drop(guard);
-                            Ok(Some(entry.value()))
-                        }
-                    } else {
-                        Ok(None)
+                    unsafe {
+                        entry.defer_value_drop(guard);
+                        Ok(Some(entry.value()))
                     }
                 } else {
                     Ok(None)
@@ -928,7 +949,7 @@ impl<K: Ord, V> Node<K, V> {
                 key,
                 value,
                 index: next_entry_index,
-                existing_entry: None, // will be filled by caller if needed
+                overwritten_entry: None, // will be filled by caller if needed
                 prev_status_word: current_status.clone(),
                 await_reserved_entries,
             })
@@ -959,19 +980,11 @@ impl<K: Ord, V> Drop for Node<K, V> {
         // node removed from tree structure and all threads which
         // perform tree scan already completed.
         let guard = unsafe { crossbeam_epoch::unprotected() };
-        // this set tracks upserts which drops previous value of key.
-        // if we already saw the key, that indicates that current entry points to original value
-        // which was replaced by upsert. Such value already dropped during upsert operation and
-        // should be skipped here.
-        let mut already_scanned = BTreeSet::new();
         for entry in self.data_block.drain(..).rev() {
             let metadata: Metadata = entry.metadata.read(guard).into();
-            if metadata.visible_or_deleted() {
-                unsafe {
-                    let key = entry.key.assume_init();
-                    if already_scanned.insert(key) && metadata.is_visible() {
-                        drop(entry.value.assume_init());
-                    }
+            unsafe {
+                if metadata.is_visible() {
+                    drop(entry.value.assume_init());
                 }
             }
         }
@@ -1097,7 +1110,7 @@ pub struct ReservedEntry<K, V> {
     /// Reserved metadata entry index in unsorted space
     index: usize,
     /// Index of entry inside KV block which value will be overwritten by upsert
-    existing_entry: Option<usize>,
+    overwritten_entry: Option<usize>,
     /// Status word before reservation phase starts
     prev_status_word: StatusWord,
     /// Possible key duplicate, check unsorted space entry in node before complete insert

@@ -418,7 +418,8 @@ fn mixed_scan() {
 
 #[test]
 fn all_operations_combinations() {
-    let size = 1000;
+    let size: u16 = thread_rng().gen_range(2..1000);
+    println!("Node size: {:?}", size);
     let mut last_state = Ops::new();
     let tree: BzTree<Key<u64>, String> = BzTree::with_node_size(size);
     let mut greatest_key = Key::new(0);
@@ -438,8 +439,16 @@ fn all_operations_combinations() {
                 last_state.insert(key.clone(), value.clone(), Instant::now());
                 greatest_key = greatest_key.max(key);
             }
-        } else if tree.delete(key_val, &guard).is_some() {
-            last_state.delete(key, Instant::now());
+        } else if thread_rng().gen_bool(0.5) {
+            if tree.delete(key_val, &guard).is_some() {
+                last_state.delete(key, Instant::now());
+            }
+        } else if thread_rng().gen_bool(0.5) {
+            if let Some((k, _)) = tree.pop_first(&guard) {
+                last_state.delete(k, Instant::now());
+            }
+        } else if let Some((k, _)) = tree.pop_last(&guard) {
+            last_state.delete(k, Instant::now());
         }
 
         // check get/scan
@@ -456,7 +465,8 @@ fn all_operations_combinations() {
 
 #[test]
 fn conditional_op_combinations() {
-    let size = 1000;
+    let size: u16 = thread_rng().gen_range(2..1000);
+    println!("Node size: {:?}", size);
     let mut last_state = Ops::new();
     let tree: BzTree<Key<u64>, u64> = BzTree::with_node_size(size);
     for i in 0..=size {
@@ -532,6 +542,57 @@ fn check_kv_drop() {
     assert_eq!(ref_cnt.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn pop_all_first() {
+    let node_size: usize = thread_rng().gen_range(2..150);
+    println!("Node size: {:?}", node_size);
+    let tree = BzTree::with_node_size(node_size as u16);
+    let tree_levels = 3;
+    let size = node_size.pow(tree_levels);
+    for key in 0..size {
+        let guard = crossbeam_epoch::pin();
+        tree.insert(
+            Key::new(key),
+            thread_rng().gen::<usize>().to_string(),
+            &guard,
+        );
+    }
+
+    for key in 0..size {
+        let guard = crossbeam_epoch::pin();
+        assert!(matches!(tree.pop_first(&guard), Some((k, _)) if k == Key::new(key)));
+    }
+    let guard = crossbeam_epoch::pin();
+    assert!(tree.pop_first(&guard).is_none());
+}
+
+#[test]
+fn pop_all_last() {
+    let node_size: usize = thread_rng().gen_range(2..150);
+    println!("Node size: {:?}", node_size);
+    let tree = BzTree::with_node_size(node_size as u16);
+    let tree_levels = 3;
+    let size = node_size.pow(tree_levels);
+    for key in 0..size {
+        let guard = crossbeam_epoch::pin();
+        tree.insert(
+            Key::new(key),
+            thread_rng().gen::<usize>().to_string(),
+            &guard,
+        );
+    }
+
+    for key in (0..size).rev() {
+        let guard = crossbeam_epoch::pin();
+        assert!(matches!(tree.pop_last(&guard), Some((k, _)) if k == Key::new(key)));
+    }
+    let guard = crossbeam_epoch::pin();
+    assert!(tree.pop_last(&guard).is_none());
+}
+
+//TODO: add tests which will create different patterns of inserts/deleted: inserts at beginning,
+// at the end, remove from the end, insert again into the end and so on.
+
 fn check_scanners(
     tree: &BzTree<Key<u64>, String>,
     last_state: &Ops<Key<u64>, String>,
@@ -597,12 +658,6 @@ fn check_scanners(
         }
     }
 }
-
-//TODO: add test which will fill the tree and then pop all elements
-//TODO: add test which will fill the tree and then remove all elements
-//TODO: add test which will mix all operations
-//TODO: add tests which will create different patterns of inserts/deleted: inserts at beginning,
-// at the end, remove from the end, insert again into the end and so on.
 
 #[derive(Debug)]
 struct Droppable {

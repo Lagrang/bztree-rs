@@ -65,7 +65,6 @@ where
                 }
             }
         } else {
-            let mut scanned_keys = BTreeSet::new();
             // use reversed iterator because unsorted part at end of KV block has most recent values
             for i in (0..status_word.reserved_records() as usize).rev() {
                 let entry = &node.data_block[i];
@@ -78,17 +77,9 @@ where
                     // until reserved entry will become valid
                 };
 
-                // if is first time when we see this key, we return it
-                // otherwise, most recent version(even deletion) of key
-                // already seen by scanner and older versions must be ignored.
-                if metadata.visible_or_deleted() {
-                    let key = unsafe { node.data_block[i].key() };
-                    if key_range.contains(key.borrow())
-                        && scanned_keys.insert(key)
-                        && metadata.is_visible()
-                    {
-                        kvs.push(i as u16);
-                    }
+                let key = unsafe { node.data_block[i].key() };
+                if metadata.is_visible() && key_range.contains(key.borrow()) {
+                    kvs.push(i as u16);
                 }
             }
 

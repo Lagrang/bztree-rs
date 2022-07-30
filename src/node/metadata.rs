@@ -41,11 +41,6 @@ impl Metadata {
     }
 
     #[inline(always)]
-    pub fn visible_or_deleted(&self) -> bool {
-        self.word < Self::RESERVED_MASK
-    }
-
-    #[inline(always)]
     pub fn is_visible(&self) -> bool {
         self.word == Self::VISIBLE_MASK
     }

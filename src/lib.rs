@@ -436,7 +436,7 @@ where
                 continue;
             }
 
-            if let Some(edge_entry) = edge_node.edge_kv(pop_from, guard) {
+            if let Some(edge_entry) = edge_node.conditional_edge_kv(pop_from, node_status, guard) {
                 // It's enough to only validate status word of leaf node to ensure that we pop
                 // current max element. While pop in progress, other threads can change tree
                 // shape by merge and split.
@@ -519,6 +519,7 @@ where
         loop {
             let node = self.find_leaf_for_key(&search_key, false, guard);
             if node.is_none() {
+                println!("!");
                 return false;
             }
 
@@ -561,6 +562,7 @@ where
                 }
             } else {
                 // TODO: add possibility to insert KV if not exists
+                println!("!!");
                 return false;
             }
         }
