@@ -2,7 +2,7 @@ use crate::node::metadata::Metadata;
 use crate::{Node, StatusWord};
 use crossbeam_epoch::Guard;
 use std::borrow::Borrow;
-use std::collections::{BTreeSet, Bound};
+use std::collections::Bound;
 use std::ops::RangeBounds;
 
 pub struct NodeScanner<'a, K: Ord, V> {

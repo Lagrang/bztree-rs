@@ -9,7 +9,6 @@ use mwcas::{HeapPointer, MwCas, U64Pointer};
 use status_word::StatusWord;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::mem::MaybeUninit;
 use std::ops::RangeBounds;

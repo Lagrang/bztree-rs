@@ -610,14 +610,21 @@ where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
+        let mut retries = 0;
         loop {
             if let Some(path) = self.find_path_to_key(key, false, guard) {
                 match self.merge_node(path, guard) {
                     MergeResult::Completed => break,
-                    MergeResult::Retry => {}
+                    MergeResult::Retry => {
+                        retries += 1;
+                        if retries >= 3 {
+                            break;
+                        }
+                    }
                     MergeResult::RecursiveMerge(path) => {
                         // repeat until we try recursively merge parent nodes(until we find root
                         // or some parent cannot be merged).
+                        retries = 0;
                         let mut merge_path = path;
                         while let MergeResult::RecursiveMerge(path) =
                             self.merge_node(merge_path, guard)
