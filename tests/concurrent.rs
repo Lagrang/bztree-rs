@@ -114,8 +114,167 @@ fn upsert_of_overlaping_keys() {
         },
     );
 }
-//TODO: add test which will fill the tree and then concurrently remove all elements
-//TODO: add test which will fill the tree and then concurrently pop all elements
+
+#[test]
+fn remove_all() {
+    test(
+        |size| BzTree::<String, String>::with_node_size(size as u16),
+        |tree, threads, iters| {
+            let mut base_ops = Ops::new();
+            let mut per_thread_elem_set = Vec::new();
+            let mut last_val = 0;
+            for _ in 0..threads {
+                let mut elems = Vec::with_capacity(iters);
+                (0..iters).for_each(|_| {
+                    elems.push(last_val);
+                    last_val += 1;
+                });
+                elems.shuffle(&mut thread_rng());
+                per_thread_elem_set.push(elems);
+            }
+            per_thread_elem_set.iter().for_each(|vec| {
+                vec.iter().for_each(|i| {
+                    assert!(tree.insert(i.to_string(), i.to_string(), &crossbeam_epoch::pin()));
+                    base_ops.insert(i.to_string(), i.to_string(), Instant::now());
+                })
+            });
+
+            thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for elems in &per_thread_elem_set {
+                    handles.push(scope.spawn(move |_| {
+                        let mut ops = Ops::new();
+                        for e in elems {
+                            let key = e.to_string();
+                            let guard = crossbeam_epoch::pin();
+                            let removed = tree.delete(&key, &guard);
+                            assert!(removed.is_some());
+                            assert_eq!(removed.unwrap(), &key);
+                            ops.delete(key, Instant::now());
+                        }
+                        ops
+                    }));
+                }
+                let ops = handles
+                    .drain(..)
+                    .map(|h| h.join().unwrap())
+                    .fold(Ops::new(), |ops1, ops2| ops1.merge(ops2));
+                let history = History::based_on(ops.merge(base_ops));
+                let guard = crossbeam_epoch::pin();
+                history.run_check(|key| tree.get(key, &guard));
+                assert!(tree.iter(&guard).next().is_none());
+            })
+            .unwrap();
+        },
+    );
+}
+
+#[test]
+fn pop_all_starting_from_last() {
+    test(
+        |size| BzTree::<String, String>::with_node_size(size as u16),
+        |tree, threads, iters| {
+            let mut base_ops = Ops::new();
+            for i in 0..threads * iters {
+                assert!(tree.insert(i.to_string(), i.to_string(), &crossbeam_epoch::pin()));
+                base_ops.insert(i.to_string(), i.to_string(), Instant::now());
+            }
+
+            thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for _ in 0..threads {
+                    handles.push(scope.spawn(|_| {
+                        let mut ops = Ops::new();
+                        let mut removed_keys = 0;
+                        for _ in 0..iters {
+                            let guard = crossbeam_epoch::pin();
+                            if let Some((k, v)) = tree.pop_last(&guard) {
+                                assert_eq!(&k, v);
+                                ops.delete(k, Instant::now());
+                                removed_keys += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        (ops, removed_keys)
+                    }));
+                }
+                let mut collected: Vec<(Ops<String, String>, usize)> =
+                    handles.drain(..).map(|h| h.join().unwrap()).collect();
+                assert_eq!(
+                    collected
+                        .iter()
+                        .map(|(_, removed)| removed)
+                        .fold(0, |v1, v2| v1 + v2),
+                    threads * iters
+                );
+                let ops = collected
+                    .drain(..)
+                    .map(|(ops, _)| ops)
+                    .fold(Ops::new(), |ops1, ops2| ops1.merge(ops2));
+                let history = History::based_on(ops.merge(base_ops));
+                let guard = crossbeam_epoch::pin();
+                history.run_check(|key| tree.get(key, &guard));
+                assert!(tree.iter(&guard).next().is_none());
+            })
+            .unwrap();
+        },
+    );
+}
+
+#[test]
+fn pop_all_starting_from_first() {
+    test(
+        |size| BzTree::<String, String>::with_node_size(size as u16),
+        |tree, threads, iters| {
+            let mut base_ops = Ops::new();
+            for i in 0..threads * iters {
+                assert!(tree.insert(i.to_string(), i.to_string(), &crossbeam_epoch::pin()));
+                base_ops.insert(i.to_string(), i.to_string(), Instant::now());
+            }
+
+            thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for _ in 0..threads {
+                    handles.push(scope.spawn(|_| {
+                        let mut ops = Ops::new();
+                        let mut removed_keys = 0;
+                        for _ in 0..iters {
+                            let guard = crossbeam_epoch::pin();
+                            if let Some((k, v)) = tree.pop_first(&guard) {
+                                assert_eq!(&k, v);
+                                ops.delete(k, Instant::now());
+                                removed_keys += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        (ops, removed_keys)
+                    }));
+                }
+                let mut collected: Vec<(Ops<String, String>, usize)> =
+                    handles.drain(..).map(|h| h.join().unwrap()).collect();
+                assert_eq!(
+                    collected
+                        .iter()
+                        .map(|(_, removed)| removed)
+                        .fold(0, |v1, v2| v1 + v2),
+                    threads * iters
+                );
+                let ops = collected
+                    .drain(..)
+                    .map(|(ops, _)| ops)
+                    .fold(Ops::new(), |ops1, ops2| ops1.merge(ops2));
+                let history = History::based_on(ops.merge(base_ops));
+                let guard = crossbeam_epoch::pin();
+                history.run_check(|key| tree.get(key, &guard));
+                assert!(tree.iter(&guard).next().is_none());
+            })
+            .unwrap();
+        },
+    );
+}
+
 #[test]
 fn add_and_delete() {
     let max_val = 50;
@@ -514,8 +673,10 @@ fn compute_with_value_update() {
     test(
         |size| BzTree::<String, usize>::with_node_size(size as u16),
         |tree, threads, iters| {
+            let mut base_ops = Ops::new();
             for i in 0..threads * 3 {
                 assert!(tree.insert(i.to_string(), 0, &crossbeam_epoch::pin()));
+                base_ops.insert(i.to_string(), 0, Instant::now());
             }
 
             let history = thread::scope(|scope| {
@@ -545,7 +706,7 @@ fn compute_with_value_update() {
                     .drain(..)
                     .map(|h| h.join().unwrap())
                     .fold(Ops::new(), |ops1, ops2| ops1.merge(ops2));
-                History::based_on(ops)
+                History::based_on(ops.merge(base_ops))
             })
             .unwrap();
 
