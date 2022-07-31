@@ -1,13 +1,19 @@
-use crate::status_word::StatusWord;
+mod metadata;
+pub mod scanner;
+pub mod status_word;
+
+use crate::node::scanner::NodeScanner;
 use crossbeam_epoch::Guard;
+use metadata::Metadata;
 use mwcas::{HeapPointer, MwCas, U64Pointer};
+use status_word::StatusWord;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::mem::MaybeUninit;
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
 use std::option::Option::Some;
+use std::sync::atomic;
 use std::{mem, ptr};
 
 /// BzTree node.
@@ -16,6 +22,12 @@ pub struct Node<K: Ord, V> {
     sorted_len: usize,
     data_block: Vec<Entry<K, V>>,
     readonly: bool,
+}
+
+macro_rules! deref_mut {
+    ($node: expr) => {
+        unsafe { &mut *($node as *const Node<K, V> as *mut Node<K, V>) }
+    };
 }
 
 impl<K: Ord, V> Node<K, V> {
@@ -94,19 +106,12 @@ impl<K: Ord, V> Node<K, V> {
         }
     }
 
-    pub fn insert<'g>(
-        &'g mut self,
-        key: K,
-        value: V,
-        guard: &'g Guard,
-    ) -> Result<(), InsertError<V>>
+    pub fn insert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Result<(), InsertError<V>>
     where
         K: Ord,
         V: Send + Sync,
     {
-        debug_assert!(!self.readonly);
-        let node_ptr = self as *const Node<K, V>;
-        let cur_status = unsafe { (&*node_ptr).status_word.read(guard) };
+        let cur_status = self.status_word.read(guard);
         match self.insert_phase_one(key, value, false, cur_status, guard) {
             Ok(reserved_entry) => self
                 .insert_phase_two(reserved_entry, false, guard)
@@ -119,7 +124,7 @@ impl<K: Ord, V> Node<K, V> {
     /// ## Return:
     /// Previous value associated with key, if it exists.
     pub fn upsert<'g>(
-        &'g mut self,
+        &'g self,
         key: K,
         value: V,
         guard: &'g Guard,
@@ -128,20 +133,15 @@ impl<K: Ord, V> Node<K, V> {
         K: Ord,
         V: Send + Sync,
     {
-        debug_assert!(!self.readonly);
-        let node_ptr = self as *const Node<K, V>;
-        let cur_status = unsafe { (&*node_ptr).status_word.read(guard) };
-        match self.insert_phase_one(key, value, true, cur_status, guard) {
-            Ok(reserved_entry) => self.insert_phase_two(reserved_entry, true, guard),
-            Err(e) => Err(e),
-        }
+        let cur_status = self.status_word.read(guard);
+        self.conditional_upsert(key, value, cur_status, guard)
     }
 
     /// Upsert value associated with passed key if node wasn't changed(status word is same).
     /// ## Return:
     /// Previous value associated with key, if it exists.
     pub fn conditional_upsert<'g>(
-        &'g mut self,
+        &'g self,
         key: K,
         value: V,
         cur_status: &StatusWord,
@@ -161,31 +161,31 @@ impl<K: Ord, V> Node<K, V> {
     /// Remove value associated with passed key.
     /// ## Return:
     /// Value associated with removed key
-    pub fn delete<'g, Q>(&'g mut self, key: &Q, guard: &'g Guard) -> Result<&'g V, DeleteError>
+    pub fn delete<'g, Q>(&'g self, key: &Q, guard: &'g Guard) -> Result<&'g V, DeleteError>
     where
         K: Borrow<Q>,
         Q: Ord,
     {
         debug_assert!(!self.readonly);
-        let current_status = self.status_word.read(guard);
-        if current_status.is_frozen() {
+        let status_word = self.status_word.read(guard);
+        if status_word.is_frozen() {
             return Err(DeleteError::Retry);
         }
 
         let index = self
-            .get_internal(key, &current_status, true, guard)
+            .get_internal(key, status_word, true, guard)
             .map(|(_, _, kv_index)| kv_index)
             .map_err(|_| DeleteError::KeyNotFound)?;
 
-        let new_status = current_status.delete_entry();
-        let entry = &mut self.data_block[index];
+        let entry = &mut deref_mut!(self).data_block[index];
         let cur_metadata: Metadata = entry.metadata.read(guard).into();
         if !cur_metadata.is_visible() {
             return Err(DeleteError::Retry);
         }
 
+        let new_status = status_word.delete_entry();
         let mut mwcas = MwCas::new();
-        mwcas.compare_exchange(&self.status_word, current_status, new_status);
+        mwcas.compare_exchange(&self.status_word, status_word, new_status);
         mwcas.compare_exchange_u64(
             &entry.metadata,
             cur_metadata.into(),
@@ -208,7 +208,7 @@ impl<K: Ord, V> Node<K, V> {
     /// ## Return:
     /// Value associated with removed key
     pub fn conditional_delete<'g, Q>(
-        &'g mut self,
+        &'g self,
         status_word: &StatusWord,
         kv_index: usize,
         guard: &'g Guard,
@@ -223,8 +223,11 @@ impl<K: Ord, V> Node<K, V> {
         }
 
         let new_status = status_word.delete_entry();
-        let entry = &mut self.data_block[kv_index];
+        let entry = &mut deref_mut!(self).data_block[kv_index];
         let cur_metadata: Metadata = entry.metadata.read(guard).into();
+        if cur_metadata.is_deleted() {
+            return Err(DeleteError::KeyNotFound);
+        }
         if !cur_metadata.is_visible() {
             return Err(DeleteError::Retry);
         }
@@ -266,11 +269,28 @@ impl<K: Ord, V> Node<K, V> {
             )
     }
 
+    pub fn conditional_get<'g, Q>(
+        &'g self,
+        key: &Q,
+        status_word: &StatusWord,
+        guard: &'g Guard,
+    ) -> Option<(&'g K, &'g V, usize)>
+    where
+        K: Borrow<Q>,
+        Q: Ord,
+    {
+        self.get_internal(key, status_word, true, guard)
+            .map_or_else(
+                |_| None,
+                |(key, val, val_index)| Some((key, val, val_index)),
+            )
+    }
+
     /// Get value which key is equal or greater that to passed key.  
     ///
     /// **Warning**: this method can be called only for **read-only** nodes, it ignores
     /// any updates made after node creation.
-    pub fn closest_mut<'g, Q>(&'g mut self, key: &Q, _: &'g Guard) -> Option<(&'g K, &'g mut V)>
+    pub fn closest<'g, Q>(&'g self, key: &Q, _: &'g Guard) -> Option<(&'g K, &'g mut V)>
     where
         K: PartialOrd<Q>,
         V: Clone,
@@ -302,7 +322,7 @@ impl<K: Ord, V> Node<K, V> {
             );
 
         if index < self.sorted_len {
-            let entry = &mut self.data_block[index];
+            let entry = &mut deref_mut!(self).data_block[index];
             let value = unsafe { &mut *entry.value.as_mut_ptr() };
             let key = unsafe { entry.key() };
             Some((key, value))
@@ -310,49 +330,6 @@ impl<K: Ord, V> Node<K, V> {
             // passed key is greater than any element in block
             None
         }
-    }
-
-    /// Get value which key is equal or greater that to passed key.  
-    ///
-    /// **Warning**: this method can be called only for **read-only** nodes, it ignores
-    /// any updates made after node creation.
-    pub fn closest<'g, Q>(&'g self, key: &Q, _: &'g Guard) -> Option<(&'g K, &'g V)>
-    where
-        K: PartialOrd<Q>,
-        V: Clone,
-    {
-        debug_assert!(self.readonly);
-        if self.sorted_len == 0 {
-            return None;
-        }
-
-        self.data_block[0..self.sorted_len]
-            .binary_search_by(|entry| {
-                // sorted block doesn't contain reserved entries, so it can be ignored here.
-                // sorted block can contain deleted entries, but metadata of removed entries
-                // still points to valid keys, so it's safe to compare them here.
-                unsafe { entry.key() }
-                    .borrow()
-                    .partial_cmp(key)
-                    .expect("Q type must always be comparable with K")
-            })
-            .map_or_else(
-                |closest_pos| {
-                    if closest_pos < self.sorted_len {
-                        // find position which points to element which is greater that passed key
-                        let kv = &self.data_block[closest_pos];
-                        Some(unsafe { (kv.key(), kv.value()) })
-                    } else {
-                        // passed key is greater than any element in block
-                        None
-                    }
-                },
-                |index| {
-                    // find exact match for key
-                    let kv = &self.data_block[index];
-                    Some(unsafe { (kv.key(), kv.value()) })
-                },
-            )
     }
 
     /// Get left and right siblings for entry identified by key.  
@@ -396,143 +373,142 @@ impl<K: Ord, V> Node<K, V> {
         [left, right]
     }
 
-    pub fn range<'g, Q, Range>(&'g self, key_range: Range, guard: &'g Guard) -> Scanner<K, V>
+    pub fn range<'g, Q, Range>(&'g self, key_range: Range, guard: &'g Guard) -> NodeScanner<K, V>
     where
         K: Ord + Borrow<Q>,
         Q: Ord + 'g,
         Range: RangeBounds<Q> + 'g,
     {
-        Scanner::new(self.status_word.read(guard), &self, key_range, guard)
+        NodeScanner::new(self.status_word.read(guard), self, key_range, guard)
     }
 
-    pub fn iter<'g>(&'g self, guard: &'g Guard) -> Scanner<K, V>
+    pub fn iter<'g>(&'g self, guard: &'g Guard) -> NodeScanner<K, V>
     where
         K: Ord,
     {
         self.range(.., guard)
     }
 
+    /// Find KV which placed on some of node's edge(e.g. min KV or max KV).
+    pub fn edge_kv<'g>(&'g self, edge: NodeEdge, guard: &'g Guard) -> Option<EntryWithLoc<'g, K, V>>
+    where
+        K: Ord,
+    {
+        let status_word = self.status_word().read(guard);
+        self.conditional_edge_kv(edge, status_word, guard)
+    }
+
+    /// Find KV which placed on some of node's edge(e.g. min KV or max KV) at some point of time
+    /// (represented by status word).
+    pub fn conditional_edge_kv<'g>(
+        &'g self,
+        edge: NodeEdge,
+        status_word: &StatusWord,
+        guard: &'g Guard,
+    ) -> Option<EntryWithLoc<'g, K, V>>
+    where
+        K: Ord,
+    {
+        let expected_ord = match edge {
+            NodeEdge::Left => Ordering::Less,
+            NodeEdge::Right => Ordering::Greater,
+        };
+
+        let mut unsorted_edge: Option<EntryWithLoc<K, V>> = None;
+        // do we have some KVs in unsorted part?
+        if self.sorted_len < status_word.reserved_records() as usize {
+            for index in self.sorted_len..status_word.reserved_records() as usize {
+                let entry = &self.data_block[index];
+                let metadata: Metadata = entry.metadata.read(guard).into();
+                if metadata.is_visible() {
+                    // read the key only after we ensured that entry is valid, otherwise key can
+                    // point to uninitialized memory
+                    let key = unsafe { entry.key() };
+                    unsorted_edge = unsorted_edge
+                        .map(|edge_kv| {
+                            debug_assert!(key != edge_kv.key);
+                            if key.cmp(edge_kv.key) == expected_ord {
+                                EntryWithLoc {
+                                    location: index,
+                                    key,
+                                    value: unsafe { entry.value() },
+                                }
+                            } else {
+                                edge_kv
+                            }
+                        })
+                        .or_else(|| {
+                            Some(EntryWithLoc {
+                                location: index,
+                                key,
+                                value: unsafe { entry.value() },
+                            })
+                        });
+                }
+            }
+        }
+
+        let sorted_edge = match edge {
+            NodeEdge::Left => self.data_block[..self.sorted_len]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| {
+                    let metadata: Metadata = entry.metadata.read(guard).into();
+                    if metadata.is_visible() {
+                        Some(EntryWithLoc {
+                            key: unsafe { entry.key() },
+                            value: unsafe { entry.value() },
+                            location: i,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .next(),
+            NodeEdge::Right => self.data_block[..self.sorted_len]
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(i, entry)| {
+                    let metadata: Metadata = entry.metadata.read(guard).into();
+                    if metadata.is_visible() {
+                        Some(EntryWithLoc {
+                            key: unsafe { entry.key() },
+                            value: unsafe { entry.value() },
+                            location: i,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .next(),
+        };
+
+        if sorted_edge.is_none() {
+            unsorted_edge
+        } else if unsorted_edge.is_none() {
+            sorted_edge
+        } else {
+            let sorted_edge = sorted_edge.unwrap();
+            let sorted_key = sorted_edge.key;
+            let unsorted_edge = unsorted_edge.unwrap();
+            let unsorted_key = unsorted_edge.key;
+            debug_assert!(sorted_key != unsorted_key);
+            if sorted_key.cmp(unsorted_key) == expected_ord {
+                Some(sorted_edge)
+            } else {
+                Some(unsorted_edge)
+            }
+        }
+    }
+
     pub fn last_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
     where
         K: Ord,
     {
-        let status_word = self.status_word().read(guard);
-
-        let mut unsorted_max: Option<&Entry<K, V>> = None;
-        if self.sorted_len < status_word.reserved_records() as usize {
-            // scan unsorted part first because it contain most recent values
-            for index in self.sorted_len..status_word.reserved_records() as usize {
-                let entry = &self.data_block[index];
-                let metadata = loop {
-                    let metadata: Metadata = entry.metadata.read(guard).into();
-                    if !metadata.is_reserved() {
-                        break metadata;
-                    }
-                };
-
-                if metadata.is_visible() {
-                    let key = unsafe { entry.key() };
-                    unsorted_max = unsorted_max
-                        .map(|max_kv| {
-                            if key > unsafe { max_kv.key() } {
-                                entry
-                            } else {
-                                max_kv
-                            }
-                        })
-                        .or_else(|| Some(entry));
-                }
-            }
-        }
-
-        let sorted_max = self.data_block[..self.sorted_len]
-            .iter()
-            .rev()
-            .filter_map(|entry| {
-                let metadata: Metadata = entry.metadata.read(guard).into();
-                if metadata.is_visible() {
-                    Some(entry)
-                } else {
-                    None
-                }
-            })
-            .next();
-
-        let max_kv = if sorted_max.is_none() {
-            unsorted_max
-        } else if unsorted_max.is_none() {
-            sorted_max
-        } else {
-            let sorted_key = unsafe { sorted_max.unwrap().key() };
-            let unsorted_key = unsafe { unsorted_max.unwrap().key() };
-            if sorted_key > unsorted_key {
-                sorted_max
-            } else {
-                unsorted_max
-            }
-        };
-        return max_kv.map(|kv| unsafe { (kv.key(), kv.value()) });
-    }
-
-    pub fn first_kv<'g>(&'g self, guard: &'g Guard) -> Option<(&'g K, &'g V)>
-    where
-        K: Ord,
-    {
-        let status_word = self.status_word().read(guard);
-
-        let mut unsorted_min: Option<&Entry<K, V>> = None;
-        if self.sorted_len < status_word.reserved_records() as usize {
-            // scan unsorted part first because it contain most recent values
-            for index in self.sorted_len..status_word.reserved_records() as usize {
-                let entry = &self.data_block[index];
-                let metadata = loop {
-                    let metadata: Metadata = entry.metadata.read(guard).into();
-                    if !metadata.is_reserved() {
-                        break metadata;
-                    }
-                };
-
-                if metadata.is_visible() {
-                    let key = unsafe { entry.key() };
-                    unsorted_min = unsorted_min
-                        .map(|min_kv| {
-                            if key < unsafe { min_kv.key() } {
-                                entry
-                            } else {
-                                min_kv
-                            }
-                        })
-                        .or_else(|| Some(entry));
-                }
-            }
-        }
-
-        let sorted_min = self.data_block[..self.sorted_len]
-            .iter()
-            .filter_map(|entry| {
-                let metadata: Metadata = entry.metadata.read(guard).into();
-                if metadata.is_visible() {
-                    Some(entry)
-                } else {
-                    None
-                }
-            })
-            .next();
-
-        let min_kv = if sorted_min.is_none() {
-            unsorted_min
-        } else if unsorted_min.is_none() {
-            sorted_min
-        } else {
-            let sorted_key = unsafe { sorted_min.unwrap().key() };
-            let unsorted_key = unsafe { unsorted_min.unwrap().key() };
-            if sorted_key < unsorted_key {
-                sorted_min
-            } else {
-                unsorted_min
-            }
-        };
-        return min_kv.map(|kv| unsafe { (kv.key(), kv.value()) });
+        return self
+            .edge_kv(NodeEdge::Right, guard)
+            .map(|kv| (kv.key, kv.value));
     }
 
     pub fn split_leaf(&self, guard: &Guard) -> SplitMode<K, V>
@@ -545,10 +521,7 @@ impl<K: Ord, V> Node<K, V> {
             "Node must be frozen before split"
         );
 
-        let mut kvs: Vec<(K, V)> = self
-            .iter(guard)
-            .map(|(k, v)| ((*k).clone(), (*v).clone()))
-            .collect();
+        let mut kvs: Vec<(K, V)> = self.clone_content(guard);
         let capacity = self.capacity() as u16;
         if kvs.len() < capacity as usize {
             // node contains too many updates/deletes which cause split
@@ -573,10 +546,7 @@ impl<K: Ord, V> Node<K, V> {
             "Node must be frozen before split"
         );
 
-        let mut kvs: Vec<(K, V)> = self
-            .iter(guard)
-            .map(|(k, v)| ((*k).clone(), (*v).clone()))
-            .collect();
+        let mut kvs: Vec<(K, V)> = self.clone_content(guard);
         let split_point = kvs.len() / 2;
         let left = Self::new_readonly(kvs.drain(..split_point).collect());
         let right = Self::new_readonly(kvs);
@@ -595,8 +565,8 @@ impl<K: Ord, V> Node<K, V> {
         V: Clone,
     {
         debug_assert!(
-            self.status_word.read(guard).is_frozen() && other.status_word.read(guard).is_frozen(),
-            "Both nodes must be frozen before merge"
+            self.status_word.read(guard).is_frozen(),
+            "Node must be frozen before merge"
         );
 
         let mut p1 = self
@@ -650,8 +620,8 @@ impl<K: Ord, V> Node<K, V> {
         V: Clone + Send + Sync,
     {
         debug_assert!(
-            self.status_word.read(guard).is_frozen() && other.status_word.read(guard).is_frozen(),
-            "Both nodes must be frozen before merge"
+            self.status_word.read(guard).is_frozen(),
+            "Node must be frozen before merge"
         );
 
         let len = self.estimated_len(guard);
@@ -689,6 +659,30 @@ impl<K: Ord, V> Node<K, V> {
         MergeMode::NewNode(Self::new_readonly(sorted_kvs))
     }
 
+    /// Clone all KVs of this node.
+    pub fn clone_content<'g>(&'g self, guard: &'g Guard) -> Vec<(K, V)>
+    where
+        K: Clone,
+        V: Clone,
+    {
+        self.iter(guard)
+            .map(|(key, val)| (key.clone(), val.clone()))
+            .collect()
+    }
+
+    /// Clone KVs of this node which pass the filter.
+    pub fn clone_with_filter<'g, F>(&'g self, filter: F, guard: &'g Guard) -> Vec<(K, V)>
+    where
+        K: Clone,
+        V: Clone,
+        F: FnMut(&(&K, &V)) -> bool,
+    {
+        self.iter(guard)
+            .filter(filter)
+            .map(|(key, val)| (key.clone(), val.clone()))
+            .collect()
+    }
+
     #[inline(always)]
     pub fn capacity(&self) -> usize {
         self.data_block.len()
@@ -700,8 +694,8 @@ impl<K: Ord, V> Node<K, V> {
     }
 
     /// Estimated length of node. If no updates/deleted were applied to node,
-    /// method return exact length(e.g. read only nodes should use this method
-    /// to obtain exact length because it very cheap).
+    /// method return exact length. Read-only nodes should use this method
+    /// to obtain exact length.
     #[inline(always)]
     pub fn estimated_len(&self, guard: &Guard) -> usize {
         let status_word: &StatusWord = self.status_word.read(guard);
@@ -723,7 +717,7 @@ impl<K: Ord, V> Node<K, V> {
 
     #[inline]
     pub fn try_froze(&self, guard: &Guard) -> bool {
-        let cur_status = self.status_word.read(&guard);
+        let cur_status = self.status_word.read(guard);
         if cur_status.is_frozen() {
             return false;
         }
@@ -769,14 +763,19 @@ impl<K: Ord, V> Node<K, V> {
                 // until reserved entry will become valid
             };
 
-            let entry_key = unsafe { entry.key() };
             if metadata.is_visible() {
+                // read the key only after we ensured that entry is valid, otherwise key can
+                // point to uninitialized memory
+                let entry_key = unsafe { entry.key() };
                 if entry_key.borrow() == key {
                     return Ok((entry_key, unsafe { entry.value() }, index));
                 }
-            } else if metadata.is_deleted() && entry_key.borrow() == key {
-                // most recent state of key indicates that it was deleted
-                return Err(SearchError::KeyNotFound);
+            } else if metadata.is_deleted() {
+                let entry_key = unsafe { entry.key() };
+                if entry_key.borrow() == key {
+                    // most recent state of key indicates that it was deleted
+                    return Err(SearchError::KeyNotFound);
+                }
             }
         }
 
@@ -806,7 +805,7 @@ impl<K: Ord, V> Node<K, V> {
     }
 
     fn insert_phase_one(
-        &mut self,
+        &self,
         key: K,
         value: V,
         is_upsert: bool,
@@ -834,7 +833,7 @@ impl<K: Ord, V> Node<K, V> {
                 if is_upsert {
                     self.try_reserve_entry(key, value, cur_status, false, guard)
                         .map(|mut reserved| {
-                            reserved.existing_entry = Some(index);
+                            reserved.overwritten_entry = Some(index);
                             reserved
                         })
                 } else {
@@ -854,7 +853,7 @@ impl<K: Ord, V> Node<K, V> {
     }
 
     fn insert_phase_two<'g>(
-        &'g mut self,
+        &'g self,
         mut new_entry: ReservedEntry<K, V>,
         is_upsert: bool,
         guard: &'g Guard,
@@ -871,7 +870,7 @@ impl<K: Ord, V> Node<K, V> {
                 self.get_internal(&new_entry.key, &new_entry.prev_status_word, true, guard)
             {
                 if is_upsert {
-                    new_entry.existing_entry = Some(index);
+                    new_entry.overwritten_entry = Some(index);
                 } else {
                     self.clear_reserved_entry(new_entry.index, guard);
                     return Err(InsertError::DuplicateKey);
@@ -879,21 +878,24 @@ impl<K: Ord, V> Node<K, V> {
             }
         }
 
-        // Complete write of KV into reserved entry, returns replaced entry, if this is an upsert.
+        // Complete write of KV into reserved entry.
         let index = new_entry.index;
         let reserved_metadata: Metadata = self.data_block[index].metadata.read(guard).into();
         debug_assert!(reserved_metadata.is_reserved());
 
+        let self_mut = deref_mut!(self);
         unsafe {
             // we should write KV entry before we will make it visible
-            self.data_block[index]
+            self_mut.data_block[index]
                 .key
                 .as_mut_ptr()
                 .write_volatile(new_entry.key);
-            self.data_block[index]
+            self_mut.data_block[index]
                 .value
                 .as_mut_ptr()
                 .write_volatile(new_entry.value);
+            // ensure that all written data can be seen by other threads
+            atomic::fence(atomic::Ordering::SeqCst);
         }
 
         loop {
@@ -901,35 +903,51 @@ impl<K: Ord, V> Node<K, V> {
             if current_status.is_frozen() {
                 // no one seen this KV yet, move out it from node
                 self.clear_reserved_entry(index, guard);
+                unsafe {
+                    mem::replace(&mut self_mut.data_block[index].key, MaybeUninit::uninit())
+                        .assume_init();
+                }
                 let value = unsafe {
-                    mem::replace(&mut self.data_block[index].value, MaybeUninit::uninit())
+                    mem::replace(&mut self_mut.data_block[index].value, MaybeUninit::uninit())
                         .assume_init()
                 };
                 return Err(InsertError::NodeFrozen(value));
             }
 
             let mut mwcas = MwCas::new();
-            // ensure that node is not frozen during MWCAS
-            // or status word changed by other insertion/deletion/split/merge.
-            mwcas.compare_exchange(&self.status_word, current_status, current_status.clone());
             mwcas.compare_exchange_u64(
                 &self.data_block[index].metadata,
                 reserved_metadata.into(),
                 Metadata::visible().into(),
             );
 
+            let mut new_status = current_status.clone();
+            // mark existing KV as 'deleted' if it will be overwritten by upsert operation
+            if let Some(existing_entry_index) = new_entry.overwritten_entry {
+                let existing_entry = &mut self_mut.data_block[existing_entry_index];
+                let metadata: Metadata = existing_entry.metadata.read(guard).into();
+                // No need to check that metadata is still visible here.
+                // If someone already removed this existing entry, this will be catch by status
+                // word CAS.
+                mwcas.compare_exchange_u64(
+                    &existing_entry.metadata,
+                    metadata.into(),
+                    Metadata::deleted().into(),
+                );
+                new_status = new_status.delete_entry();
+            }
+
+            // ensure that node is not frozen during MWCAS
+            // or status word changed by other insertion/deletion/split/merge.
+            mwcas.compare_exchange(&self.status_word, current_status, new_status);
+
             if mwcas.exec(guard) {
-                return if let Some(index) = new_entry.existing_entry {
-                    let entry = &mut self.data_block[index];
-                    let metadata: Metadata = entry.metadata.read(guard).into();
-                    if metadata.is_visible() {
-                        unsafe {
-                            // drop value replaced by upsert
-                            entry.defer_value_drop(guard);
-                            Ok(Some(entry.value()))
-                        }
-                    } else {
-                        Ok(None)
+                return if let Some(existing_entry_index) = new_entry.overwritten_entry {
+                    // drop value replaced by upsert
+                    let existing_entry = &mut self_mut.data_block[existing_entry_index];
+                    unsafe {
+                        existing_entry.defer_value_drop(guard);
+                        Ok(Some(existing_entry.value()))
                     }
                 } else {
                     Ok(None)
@@ -961,7 +979,7 @@ impl<K: Ord, V> Node<K, V> {
                 key,
                 value,
                 index: next_entry_index,
-                existing_entry: None, // will be filled by caller if needed
+                overwritten_entry: None, // will be filled by caller if needed
                 prev_status_word: current_status.clone(),
                 await_reserved_entries,
             })
@@ -992,15 +1010,14 @@ impl<K: Ord, V> Drop for Node<K, V> {
         // node removed from tree structure and all threads which
         // perform tree scan already completed.
         let guard = unsafe { crossbeam_epoch::unprotected() };
-        let mut already_scanned = BTreeSet::new();
         for entry in self.data_block.drain(..).rev() {
             let metadata: Metadata = entry.metadata.read(guard).into();
-            if metadata.visible_or_deleted() {
-                unsafe {
-                    let key = entry.key.assume_init();
-                    if already_scanned.insert(key) && metadata.is_visible() {
-                        drop(entry.value.assume_init());
-                    }
+            unsafe {
+                if metadata.is_visible() || metadata.is_deleted() {
+                    drop(entry.key.assume_init());
+                }
+                if metadata.is_visible() {
+                    drop(entry.value.assume_init());
                 }
             }
         }
@@ -1034,6 +1051,12 @@ where
     }
 }
 
+pub struct EntryWithLoc<'a, K, V> {
+    pub key: &'a K,
+    pub value: &'a V,
+    pub location: usize,
+}
+
 struct Entry<K, V> {
     metadata: U64Pointer,
     key: MaybeUninit<K>,
@@ -1042,16 +1065,25 @@ struct Entry<K, V> {
 }
 
 impl<K, V> Entry<K, V> {
+    /// Read the key part of entry.
+    /// *Warning*: before reading the key reference, caller should ensure that entry is valid.
+    /// Otherwise, key can points to uninitialized memory.
     #[inline(always)]
     unsafe fn key(&self) -> &K {
         &*self.key.as_ptr()
     }
 
+    /// Read the value part of entry.
+    /// *Warning*: before reading the value reference, caller should ensure that entry is valid.
+    /// Otherwise, value can points to uninitialized memory.
     #[inline(always)]
     unsafe fn value(&self) -> &V {
         &*self.value.as_ptr()
     }
 
+    /// Read the value part of entry.
+    /// *Warning*: before reading the value reference, caller should ensure that entry is valid.
+    /// Otherwise, value can points to uninitialized memory.
     #[inline(always)]
     unsafe fn value_mut(&mut self) -> &mut V {
         &mut *self.value.as_mut_ptr()
@@ -1094,189 +1126,6 @@ impl<K, V> Entry<K, V> {
     }
 }
 
-pub struct Scanner<'a, K: Ord, V> {
-    node: &'a Node<K, V>,
-    // BzTree node can allocate maximum u16::MAX records,
-    // use u16 instead of usize to reduce size of scanner
-    kv_indexes: Vec<u16>,
-    fwd_idx: u16,
-    rev_idx: u16,
-}
-
-impl<'a, K, V> Scanner<'a, K, V>
-where
-    K: Ord,
-{
-    fn new<Q>(
-        status_word: &StatusWord,
-        node: &'a Node<K, V>,
-        key_range: impl RangeBounds<Q>,
-        guard: &'a Guard,
-    ) -> Self
-    where
-        K: Borrow<Q>,
-        Q: Ord,
-    {
-        let mut kvs: Vec<u16> = Vec::with_capacity(status_word.reserved_records() as usize);
-
-        if node.readonly || status_word.reserved_records() as usize == node.sorted_len {
-            if node.sorted_len > 0 {
-                let sorted_block = &node.data_block[0..node.sorted_len];
-                let start_idx = match key_range.start_bound() {
-                    Bound::Excluded(key) => sorted_block
-                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
-                        .map_or_else(|index| index, |index| index + 1),
-                    Bound::Included(key) => sorted_block
-                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
-                        .map_or_else(|index| index, |index| index),
-                    Bound::Unbounded => 0,
-                };
-
-                let end_idx = match key_range.end_bound() {
-                    Bound::Excluded(key) => sorted_block
-                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
-                        .map_or_else(|index| index, |index| index),
-                    Bound::Included(key) => sorted_block
-                        .binary_search_by(|entry| unsafe { entry.key() }.borrow().cmp(key))
-                        .map_or_else(|index| index, |index| index + 1),
-                    Bound::Unbounded => node.sorted_len,
-                };
-
-                if !node.readonly {
-                    (start_idx..end_idx).for_each(|i| {
-                        let metadata: Metadata = node.data_block[i].metadata.read(guard).into();
-                        if metadata.is_visible() {
-                            kvs.push(i as u16);
-                        }
-                    });
-                } else {
-                    (start_idx..end_idx).for_each(|i| kvs.push(i as u16));
-                }
-            }
-        } else {
-            let mut scanned_keys = BTreeSet::new();
-            // use reversed iterator because unsorted part at end of KV block has most recent values
-            for i in (0..status_word.reserved_records() as usize).rev() {
-                let entry = &node.data_block[i];
-                let metadata = loop {
-                    let metadata: Metadata = entry.metadata.read(guard).into();
-                    if !metadata.is_reserved() {
-                        break metadata;
-                    }
-                    // someone try to add entry at same time, continue check same entry
-                    // until reserved entry will become valid
-                };
-
-                // if is first time when we see this key, we return it
-                // otherwise, most recent version(even deletion) of key
-                // already seen by scanner and older versions must be ignored.
-                if metadata.visible_or_deleted() {
-                    let key = unsafe { node.data_block[i].key() };
-                    if key_range.contains(key.borrow())
-                        && scanned_keys.insert(key)
-                        && metadata.is_visible()
-                    {
-                        kvs.push(i as u16);
-                    }
-                }
-            }
-
-            kvs.sort_by(|index1, index2| {
-                let key1 = unsafe { node.data_block[*index1 as usize].key() };
-                let key2 = unsafe { node.data_block[*index2 as usize].key() };
-                key1.cmp(key2)
-            });
-        }
-
-        if kvs.is_empty() {
-            return Scanner {
-                // move 'forward' index in front of 'reversed' to simulate empty scanner
-                fwd_idx: 1,
-                rev_idx: 0,
-                kv_indexes: kvs,
-                node,
-            };
-        }
-
-        Scanner {
-            fwd_idx: 0,
-            rev_idx: (kvs.len() - 1) as u16,
-            kv_indexes: kvs,
-            node,
-        }
-    }
-
-    pub fn peek_next(&mut self) -> Option<(&'a K, &'a V)> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.fwd_idx as usize] as usize;
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-
-    pub fn peek_next_back(&mut self) -> Option<(&'a K, &'a V)> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.rev_idx as usize] as usize;
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-}
-
-impl<'a, K: Ord, V> Iterator for Scanner<'a, K, V> {
-    type Item = (&'a K, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.fwd_idx as usize] as usize;
-            self.fwd_idx += 1;
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = if self.rev_idx < self.fwd_idx {
-            0
-        } else {
-            (self.rev_idx - self.fwd_idx + 1) as usize
-        };
-        (size, Some(size))
-    }
-}
-
-impl<'a, K: Ord, V> DoubleEndedIterator for Scanner<'a, K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.rev_idx >= self.fwd_idx {
-            let index = self.kv_indexes[self.rev_idx as usize] as usize;
-            if self.rev_idx > 0 {
-                self.rev_idx -= 1;
-            } else {
-                // reversed iteration reaches 0 element,
-                // to break iteration, we move 'forward' index in front of 'reversed'
-                // because we can't set -1 to rev_idx because it unsigned.
-                self.fwd_idx = self.rev_idx + 1;
-            }
-            let kv = &self.node.data_block[index];
-            Some(unsafe { (kv.key(), kv.value()) })
-        } else {
-            None
-        }
-    }
-}
-
-impl<'a, K: Ord, V> ExactSizeIterator for Scanner<'a, K, V> {
-    fn len(&self) -> usize {
-        self.size_hint().0
-    }
-}
-
 pub enum MergeMode<K: Ord, V> {
     /// Merge completed successfully. Returns new node which contains
     /// elements of both source nodes.
@@ -1303,7 +1152,7 @@ pub struct ReservedEntry<K, V> {
     /// Reserved metadata entry index in unsorted space
     index: usize,
     /// Index of entry inside KV block which value will be overwritten by upsert
-    existing_entry: Option<usize>,
+    overwritten_entry: Option<usize>,
     /// Status word before reservation phase starts
     prev_status_word: StatusWord,
     /// Possible key duplicate, check unsorted space entry in node before complete insert
@@ -1333,91 +1182,10 @@ pub enum SearchError {
     KeyNotFound,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-#[repr(transparent)]
-struct Metadata {
-    word: u64,
-}
-
-impl Metadata {
-    const NOT_USED_MASK: u64 = 0x0000_0000_0000_0004;
-    const RESERVED_MASK: u64 = 0x0000_0000_0000_0002;
-    const DELETED_MASK: u64 = 0x0000_0000_0000_0001;
-    const VISIBLE_MASK: u64 = 0x0000_0000_0000_0000;
-
-    #[inline(always)]
-    fn visible() -> Metadata {
-        Metadata {
-            word: Self::VISIBLE_MASK,
-        }
-    }
-
-    #[inline(always)]
-    fn reserved() -> Metadata {
-        Metadata {
-            word: Self::RESERVED_MASK,
-        }
-    }
-
-    #[inline(always)]
-    fn deleted() -> Metadata {
-        Metadata {
-            word: Self::DELETED_MASK,
-        }
-    }
-
-    #[inline(always)]
-    fn not_used() -> Metadata {
-        Metadata {
-            word: Self::NOT_USED_MASK,
-        }
-    }
-
-    #[inline(always)]
-    fn visible_or_deleted(&self) -> bool {
-        self.word < Self::RESERVED_MASK
-    }
-
-    #[inline(always)]
-    fn is_visible(&self) -> bool {
-        self.word == Self::VISIBLE_MASK
-    }
-
-    #[inline(always)]
-    fn is_deleted(&self) -> bool {
-        self.word == Self::DELETED_MASK
-    }
-
-    #[inline(always)]
-    fn is_reserved(&self) -> bool {
-        self.word == Self::RESERVED_MASK
-    }
-}
-
-impl From<u64> for Metadata {
-    fn from(word: u64) -> Self {
-        Metadata { word }
-    }
-}
-
-impl From<Metadata> for u64 {
-    fn from(word: Metadata) -> Self {
-        word.word
-    }
-}
-
-impl From<Metadata> for U64Pointer {
-    fn from(word: Metadata) -> Self {
-        Self::new(word.word)
-    }
-}
-
-impl From<U64Pointer> for Metadata {
-    fn from(word: U64Pointer) -> Self {
-        Self {
-            word: word.read(&crossbeam_epoch::pin()),
-        }
-    }
+#[derive(Debug, Copy, Clone)]
+pub enum NodeEdge {
+    Left,
+    Right,
 }
 
 #[cfg(test)]
@@ -1442,7 +1210,7 @@ mod tests {
     #[test]
     fn insert_and_search() {
         let elements = 500;
-        let mut node = create_str_node(elements);
+        let node = create_str_node(elements);
         for i in 0..elements {
             let guard = crossbeam_epoch::pin();
             let key = i.to_string();
@@ -1459,7 +1227,7 @@ mod tests {
     #[test]
     fn upsert_and_search() {
         let elements = 500;
-        let mut node = create_str_node(elements);
+        let node = create_str_node(elements);
         for i in 0..elements {
             let guard = crossbeam_epoch::pin();
             let key = i.to_string();
@@ -1476,7 +1244,7 @@ mod tests {
     #[test]
     fn insert_existing_key() {
         let guard = crossbeam_epoch::pin();
-        let mut node = create_str_node(2);
+        let node = create_str_node(2);
         let (key, value) = rand_kv();
         node.insert(key.clone(), value, &guard).unwrap();
         let result = node.insert(key, value, &guard);
@@ -1486,7 +1254,7 @@ mod tests {
     #[test]
     fn update_key() {
         let max_elements = 500;
-        let mut node = create_str_node(max_elements * 2); // upsert create new KV
+        let node = create_str_node(max_elements * 2); // upsert create new KV
         for i in 0..max_elements {
             let guard = crossbeam_epoch::pin();
             let key = i.to_string();
@@ -1506,7 +1274,7 @@ mod tests {
     #[test]
     fn delete_keys() {
         let elements = 128u16;
-        let mut node = create_wrapped_u16_node(elements * 2);
+        let node = create_wrapped_u16_node(elements * 2);
 
         for i in 0..elements {
             let guard = crossbeam_epoch::pin();
@@ -1532,7 +1300,7 @@ mod tests {
     #[test]
     fn delete_non_existing_keys() {
         let max_elements = 500;
-        let mut node = create_wrapped_u16_node(max_elements);
+        let node = create_wrapped_u16_node(max_elements);
 
         for i in 0..max_elements {
             let guard = crossbeam_epoch::pin();
@@ -1550,7 +1318,7 @@ mod tests {
     fn split_node() {
         for _ in 0..100 {
             let max_elements = thread_rng().gen_range(1..100);
-            let mut node = create_str_node(max_elements);
+            let node = create_str_node(max_elements);
             let mut elem_count = 0;
             let guard = crossbeam_epoch::pin();
             for _ in 0..max_elements {
@@ -1584,7 +1352,7 @@ mod tests {
     fn compact_node() {
         for _ in 0..100 {
             let elements = thread_rng().gen_range(1..100);
-            let mut node = create_str_node(elements * 2);
+            let node = create_str_node(elements * 2);
             let guard = crossbeam_epoch::pin();
             for i in 0..elements {
                 let key = i.to_string();
@@ -1639,16 +1407,8 @@ mod tests {
                 thread_rng().gen_range(0..expected_elems.len())
             };
             let (vec1, vec2) = expected_elems.split_at(split_point);
-            let node1 = Node::new_readonly(
-                vec1.iter()
-                    .map(|(k, v)| ((*k).clone(), (*v).clone()))
-                    .collect(),
-            );
-            let node2 = Node::new_readonly(
-                vec2.iter()
-                    .map(|(k, v)| ((*k).clone(), (*v).clone()))
-                    .collect(),
-            );
+            let node1 = Node::new_readonly(vec1.iter().map(|(k, v)| (**k, **v)).collect());
+            let node2 = Node::new_readonly(vec2.iter().map(|(k, v)| (**k, **v)).collect());
 
             let guard = crossbeam_epoch::pin();
             node1.try_froze(&guard);
@@ -1705,7 +1465,7 @@ mod tests {
     #[test]
     #[allow(clippy::reversed_empty_ranges)]
     fn scan_on_unsorted_node() {
-        let mut node = Node::with_capacity(150);
+        let node = Node::with_capacity(150);
 
         let min = 1;
         let max = 10;
@@ -1773,7 +1533,7 @@ mod tests {
 
         let max_elements = (sorted.len() * 5) as u16;
         let elems: Vec<(i32, i32)> = sorted.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut node = Node::init_with_capacity(elems, max_elements);
+        let node = Node::init_with_capacity(elems, max_elements);
 
         let guard = crossbeam_epoch::pin();
         node.insert(max, max + 1, &guard)
@@ -1831,7 +1591,7 @@ mod tests {
         let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)];
         let max_elements = (vec.len() * 4) as u16;
         let elems: Vec<(u32, u32)> = vec.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut node = Node::init_with_capacity(elems, max_elements);
+        let node = Node::init_with_capacity(elems, max_elements);
         node.insert(4, 4, &guard).unwrap();
         node.insert(5, 5, &guard).unwrap();
         node.insert(6, 6, &guard).unwrap();
@@ -1883,7 +1643,7 @@ mod tests {
         let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)];
         let max_elements = (vec.len() * 4) as u16;
         let elems: Vec<(u32, u32)> = vec.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut node = Node::init_with_capacity(elems, max_elements);
+        let node = Node::init_with_capacity(elems, max_elements);
 
         node.insert(4, 4, &guard).unwrap();
         node.insert(5, 6, &guard).unwrap();
@@ -1915,7 +1675,7 @@ mod tests {
         let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)];
         let max_elements = (vec.len() * 4) as u16;
         let elems: Vec<(u32, u32)> = vec.iter().map(|(k, v)| (*k, *v)).collect();
-        let mut node = Node::init_with_capacity(elems, max_elements);
+        let node = Node::init_with_capacity(elems, max_elements);
 
         node.insert(4, 4, &guard).unwrap();
         node.insert(5, 5, &guard).unwrap();
@@ -1943,7 +1703,7 @@ mod tests {
     #[test]
     fn iter_on_empty_sorted_space() {
         let guard = crossbeam_epoch::pin();
-        let mut node: Node<u32, u32> = Node::with_capacity(10);
+        let node: Node<u32, u32> = Node::with_capacity(10);
         node.insert(1, 1, &guard).unwrap();
         node.insert(2, 2, &guard).unwrap();
         node.insert(3, 3, &guard).unwrap();
@@ -1984,37 +1744,13 @@ mod tests {
     }
 
     #[test]
-    fn peek_next() {
-        let guard = crossbeam_epoch::pin();
-        let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)]
-            .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
-        let mut node = Node::init_with_capacity(vec, 4);
-
-        node.insert(4, 4, &guard).unwrap();
-
-        let mut iter = node.iter(&guard);
-        assert!(matches!(iter.peek_next(), Some((k, _)) if *k == 1));
-        iter.next();
-        assert!(matches!(iter.peek_next(), Some((k, _)) if *k == 2));
-        iter.next();
-        assert!(matches!(iter.peek_next(), Some((k, _)) if *k == 3));
-        iter.next();
-        assert!(matches!(iter.peek_next(), Some((k, _)) if *k == 4));
-        iter.next();
-        assert_eq!(iter.len(), 0);
-        assert!(iter.next().is_none());
-    }
-
-    #[test]
     fn peek_next_back() {
         let guard = crossbeam_epoch::pin();
         let vec: Vec<(u32, u32)> = vec![(1, 1), (2, 2), (3, 3)]
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        let mut node = Node::init_with_capacity(vec, 4);
+        let node = Node::init_with_capacity(vec, 4);
 
         node.insert(4, 4, &guard).unwrap();
 
@@ -2032,28 +1768,10 @@ mod tests {
     }
 
     #[test]
-    fn min() {
-        let guard = crossbeam_epoch::pin();
-        let sorted: Vec<(u32, u32)> = vec![(1, 1), (3, 3), (4, 4), (5, 5)];
-        let mut node: Node<u32, u32> =
-            Node::init_with_capacity(sorted.clone(), (sorted.len() * 2) as u16);
-
-        assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 1 ));
-
-        node.insert(0, 0, &guard).unwrap();
-        assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 0 ));
-
-        node.delete(&0, &guard).unwrap();
-        assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 1 ));
-        node.delete(&1, &guard).unwrap();
-        assert!(matches!(node.first_kv(&guard), Some((k, _)) if *k == 3 ));
-    }
-
-    #[test]
     fn max() {
         let guard = crossbeam_epoch::pin();
         let sorted: Vec<(u32, u32)> = vec![(1, 1), (3, 3), (4, 4), (5, 5)];
-        let mut node: Node<u32, u32> =
+        let node: Node<u32, u32> =
             Node::init_with_capacity(sorted.clone(), (sorted.len() * 2) as u16);
 
         assert!(matches!(node.last_kv(&guard), Some((k, _)) if *k == 5 ));
@@ -2089,7 +1807,7 @@ mod tests {
 
     #[cfg(test)]
     mod metadata_tests {
-        use crate::node::Metadata;
+        use crate::node::metadata::Metadata;
 
         #[test]
         fn create_reserved_metadata() {

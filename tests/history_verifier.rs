@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
+use std::fmt::Write as FmtWrite;
 use std::hash::Hash;
 use std::ops::RangeBounds;
 use std::time::Instant;
@@ -75,14 +76,31 @@ where
                 })
                 .last()
                 .unwrap_or_else(|| {
-                    panic!(
-                        "Key has value {:?} which is not expected by execution history: {:?}. \
-                        Full history of changes(sorted by time) for key '{:?}': {:?}",
-                        val,
-                        possible_values,
-                        key,
-                        self.full_history.get(key)
+                    let mut msg = String::new();
+                    writeln!(
+                        &mut msg,
+                        "Key [{:?}] has value {:?} which is not expected by execution history",
+                        key, val
                     )
+                    .unwrap();
+
+                    writeln!(&mut msg, "Expected values: ").unwrap();
+                    for (i, val) in possible_values.iter().enumerate() {
+                        writeln!(&mut msg, "{:?}: {:?}", i, val).unwrap();
+                    }
+
+                    if let Some(changes) = self.full_history.get(key) {
+                        writeln!(
+                            &mut msg,
+                            "Full history of changes(sorted by time) for key '{:?}'",
+                            key
+                        )
+                        .unwrap();
+                        changes
+                            .iter()
+                            .for_each(|opt| writeln!(&mut msg, "{:?}", opt).unwrap());
+                    }
+                    panic!("{}", msg)
                 });
         }
     }

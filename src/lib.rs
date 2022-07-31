@@ -2,7 +2,7 @@
 //! Concurrent B-tree implementation based on paper
 //! [BzTree: A High-Performance Latch-free Range Index for Non-Volatile Memory](http://www.vldb.org/pvldb/vol11/p553-arulraj.pdf).
 //! Current implementation doesn't support non-volatile memory and supposed to be used only as
-//! in-memory(not persistent) data structure.  
+//! in-memory(not persistent) data structure.
 //! BzTree uses [MwCAS](https://crates.io/crates/mwcas) crate to get access to multi-word CAS.
 //!
 //! # Examples
@@ -36,20 +36,20 @@
 
 mod node;
 mod scanner;
-mod status_word;
 
-use crate::node::{DeleteError, InsertError, MergeMode, Node, SplitMode};
+use crate::node::{DeleteError, InsertError, MergeMode, Node, NodeEdge, SplitMode};
 use crate::scanner::Scanner;
+use crate::NodePointer::{Interim, Leaf};
 use crossbeam_epoch::Guard;
 use mwcas::{HeapPointer, MwCas};
-use status_word::StatusWord;
+use node::status_word::StatusWord;
 use std::borrow::Borrow;
+use std::fmt::Debug;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::option::Option::Some;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// BzTree data structure.  
+/// BzTree data structure.
 ///
 /// # Key-value trait bounds
 ///
@@ -83,13 +83,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// # Thread safety
 /// BzTree can be safely shared between threads, e.g. it implements [Send] ans [Sync].
-///
 pub struct BzTree<K: Ord, V> {
-    root: HeapPointer<NodePointer<K, V>>,
+    root: NodeLink<K, V>,
     node_size: usize,
 }
 
+type NodeLink<K, V> = HeapPointer<NodePointer<K, V>>;
+
 unsafe impl<K: Ord, V> Send for BzTree<K, V> {}
+
 unsafe impl<K: Ord, V> Sync for BzTree<K, V> {}
 
 /// Leaf node of tree actually store KV pairs.
@@ -100,7 +102,7 @@ type LeafNode<K, V> = Node<K, V>;
 /// Interim node always contain special guard cell which represent
 /// 'positive infinite' key. This cell used to store link to node
 /// which keys greater than any other key in current interim node.
-type InterimNode<K, V> = Node<Key<K>, HeapPointer<NodePointer<K, V>>>;
+type InterimNode<K, V> = Node<Key<K>, NodeLink<K, V>>;
 
 impl<K, V> BzTree<K, V>
 where
@@ -138,10 +140,10 @@ where
     /// assert!(!tree.insert(key.clone(), 5, &guard));
     /// ```
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
-        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         let mut value: V = value;
+        let search_key = Key::new(key.clone());
         loop {
-            let node = self_mut.find_leaf_mut(&key, guard);
+            let node = self.find_leaf_for_key(&search_key, true, guard).unwrap();
             match node.insert(key.clone(), value, guard) {
                 Ok(_) => {
                     return true;
@@ -150,11 +152,13 @@ where
                     value = val;
                     // try to find path to overflowed node
                     let leaf_ptr = node as *const LeafNode<K, V>;
-                    let path = self.find_node_for_key(&key, guard);
-                    if let NodePointer::Leaf(found_leaf) = path.node_pointer {
-                        // if overflowed node is not split/merged by other thread during insert
-                        if ptr::eq(leaf_ptr, found_leaf.deref()) {
-                            self.split_leaf(path, guard);
+                    let path = self.find_path_to_key(&search_key, false, guard);
+                    if let Some(path) = path {
+                        if let Leaf(found_leaf) = path.node_pointer {
+                            // if overflowed node is not split/merged by other thread during insert
+                            if ptr::eq(leaf_ptr, found_leaf.deref()) {
+                                self.split_leaf(path, guard);
+                            }
                         }
                     }
                 }
@@ -184,24 +188,26 @@ where
     /// assert!(matches!(tree.upsert(key.clone(), 11, &guard), Some(10)));
     /// ```
     pub fn upsert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
-        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
         let mut value: V = value;
+        let search_key = Key::new(key.clone());
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = self_mut.find_leaf_ptr(&key, &guard);
-            match unsafe { (*node).upsert(key.clone(), value, guard) } {
+            let node = self.find_leaf_for_key(&search_key, true, guard).unwrap();
+            match node.upsert(key.clone(), value, guard) {
                 Ok(prev_val) => {
                     return prev_val;
                 }
                 Err(InsertError::Split(val)) => {
                     value = val;
                     // try to find path to overflowed node
-                    let path = self.find_node_for_key(&key, guard);
-                    if let NodePointer::Leaf(found_leaf) = path.node_pointer {
-                        // if overflowed node is not split/merged by other thread
-                        if ptr::eq(node, found_leaf.deref()) {
-                            self.split_leaf(path, guard);
+                    let path = self.find_path_to_key(&search_key, false, guard);
+                    if let Some(path) = path {
+                        if let Leaf(found_leaf) = path.node_pointer {
+                            // if overflowed node is not split/merged by other thread
+                            if ptr::eq(node, found_leaf.deref()) {
+                                self.split_leaf(path, guard);
+                            }
                         }
                     }
                 }
@@ -235,21 +241,24 @@ where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
-        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
+        let search_key = Key::new(key.clone());
         loop {
             // use raw pointer to overcome borrowing rules in loop
             // which borrows value even on return statement
-            let node = self_mut.find_leaf_ptr(key, guard);
-            let len = unsafe { (*node).estimated_len(guard) };
-            match unsafe { (*node).delete(key.borrow(), guard) } {
-                Ok(val) => {
-                    if self.should_merge(len - 1) {
-                        self.merge_recursive(key, guard);
+            if let Some(node) = self.find_leaf_for_key(&search_key, false, guard) {
+                let len = node.estimated_len(guard);
+                match node.delete(key.borrow(), guard) {
+                    Ok(val) => {
+                        if self.should_merge(len - 1) {
+                            self.merge_recursive(&search_key, guard);
+                        }
+                        return Some(val);
                     }
-                    return Some(val);
+                    Err(DeleteError::KeyNotFound) => return None,
+                    Err(DeleteError::Retry) => {}
                 }
-                Err(DeleteError::KeyNotFound) => return None,
-                Err(DeleteError::Retry) => {}
+            } else {
+                return None;
             }
         }
     }
@@ -272,9 +281,9 @@ where
         K: Borrow<Q>,
         Q: Clone + Ord,
     {
-        self.find_leaf(&key, guard)
-            .get(&key, guard)
-            .map(|(_, val, _, _)| val)
+        let search_key = Key::new(key.clone());
+        self.find_leaf_for_key(&search_key, false, guard)
+            .and_then(|node| node.get(key, guard).map(|(_, val, _, _)| val))
     }
 
     /// Create tree range scanner which will return values whose keys is in passed range.
@@ -304,8 +313,8 @@ where
         guard: &'g Guard,
     ) -> impl DoubleEndedIterator<Item = (&'g K, &'g V)> + 'g {
         return match self.root.read(guard) {
-            NodePointer::Leaf(root) => Scanner::from_leaf_root(root, key_range, guard),
-            NodePointer::Interim(root) => Scanner::from_non_leaf_root(root, key_range, guard),
+            Leaf(root) => Scanner::from_leaf_root(root, key_range, guard),
+            Interim(root) => Scanner::from_non_leaf_root(root, key_range, guard),
         };
     }
 
@@ -393,19 +402,7 @@ where
     /// assert!(matches!(tree.pop_first(&guard), None));
     /// ```
     pub fn pop_first<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        // TODO: optimize priority queue like APIs
-        let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
-        loop {
-            let key = if let Some((key, _)) = (unsafe { &*self_mut }).iter(guard).next() {
-                key.clone()
-            } else {
-                return None;
-            };
-
-            if let Some(val) = (unsafe { &mut *self_mut }).delete(&key, guard) {
-                return Some((key, val));
-            }
-        }
+        self.pop(NodeEdge::Left, guard)
     }
 
     /// Remove and return last element of tree according to key ordering.
@@ -427,16 +424,54 @@ where
     /// assert!(matches!(tree.pop_last(&guard), None));
     /// ```
     pub fn pop_last<'g>(&'g self, guard: &'g Guard) -> Option<(K, &'g V)> {
-        let self_mut = self as *const BzTree<K, V> as *mut BzTree<K, V>;
-        loop {
-            let key = if let Some((key, _)) = (unsafe { &*self_mut }).iter(guard).rev().next() {
-                key.clone()
-            } else {
-                return None;
-            };
+        self.pop(NodeEdge::Right, guard)
+    }
 
-            if let Some(val) = (unsafe { &mut *self_mut }).delete(&key, guard) {
-                return Some((key, val));
+    fn pop<'g>(&'g self, pop_from: NodeEdge, guard: &'g Guard) -> Option<(K, &'g V)> {
+        loop {
+            let (edge_node, edge_key) = self.find_edge_node(pop_from, guard);
+            let node_status = edge_node.status_word().read(guard);
+            if node_status.is_frozen() {
+                // found node already removed from tree, restart
+                continue;
+            }
+
+            if let Some(edge_entry) = edge_node.conditional_edge_kv(pop_from, node_status, guard) {
+                // It's enough to only validate status word of leaf node to ensure that we pop
+                // current max element. While pop in progress, other threads can change tree
+                // shape by merge and split.
+                // If node which currently contains min/max element is merged/split, we will
+                // detect such change by checking node's status word.
+                // Merging of parent node also can proceed without additional validation
+                // because merge of parent do not change ordering of leaf elements.
+                // Split of parent node have 2 cases:
+                // 1. split caused by overflow of other leaf node(e.g., not current min/max node).
+                // In this case min or max node still contain min/max value and can be used for
+                // pop operation.
+                // 2. split caused by overflow of current min/max node.
+                // This case covered by status word validation.
+                let len = edge_node.estimated_len(guard);
+                match edge_node.conditional_delete(node_status, edge_entry.location, guard) {
+                    Ok(_) => {
+                        if self.should_merge(len - 1) {
+                            if let Some(k) = edge_key {
+                                self.merge_recursive(k, guard);
+                            }
+                        }
+                        return Some((edge_entry.key.clone(), edge_entry.value));
+                    }
+                    Err(DeleteError::Retry) | Err(DeleteError::KeyNotFound) => {}
+                }
+            } else {
+                if self.root.read(guard).points_to_leaf(edge_node) {
+                    // current max/min node is empty and it is the root of tree
+                    return None;
+                }
+                // node with max possible key is empty,
+                // we should help to merge such node and try again
+                if let Some(k) = edge_key {
+                    self.merge_recursive(k, guard);
+                }
             }
         }
     }
@@ -473,33 +508,38 @@ where
     ///  }
     /// }, &guard));
     /// assert!(matches!(tree.get(&key, &guard), None));
-    /// ```    
+    /// ```
     pub fn compute<'g, Q, F>(&'g self, key: &Q, mut new_val: F, guard: &'g Guard) -> bool
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
         F: FnMut((&K, &V)) -> Option<V>,
     {
-        let self_mut = unsafe { &mut *(self as *const BzTree<K, V> as *mut BzTree<K, V>) };
+        let search_key = Key::new(key.clone());
         loop {
-            let node = self_mut.find_leaf_ptr(key, guard);
-            if let Some((found_key, val, status_word, value_index)) =
-                unsafe { (*node).get(key, guard) }
+            let node = self.find_leaf_for_key(&search_key, false, guard);
+            if node.is_none() {
+                return false;
+            }
+
+            let node = node.unwrap();
+            let status_word = node.status_word().read(guard);
+            if let Some((found_key, val, kv_index)) = node.conditional_get(key, status_word, guard)
             {
+                // compute new value for key
                 if let Some(new_val) = new_val((found_key, val)) {
-                    match unsafe {
-                        (*node).conditional_upsert(found_key.clone(), new_val, status_word, guard)
-                    } {
+                    match node.conditional_upsert(found_key.clone(), new_val, status_word, guard) {
                         Ok(_) => {
                             return true;
                         }
                         Err(InsertError::Split(_)) => {
                             // try to find path to overflowed node
-                            let path = self.find_node_for_key(key, guard);
-                            if let NodePointer::Leaf(found_leaf) = path.node_pointer {
-                                // if overflowed node is not split/merged by other thread
-                                if ptr::eq(node, found_leaf.deref()) {
-                                    self.split_leaf(path, guard);
+                            if let Some(path) = self.find_path_to_key(&search_key, false, guard) {
+                                if let Leaf(found_leaf) = path.node_pointer {
+                                    // if overflowed node is not split/merged by other thread
+                                    if ptr::eq(node, found_leaf.deref()) {
+                                        self.split_leaf(path, guard);
+                                    }
                                 }
                             }
                         }
@@ -509,11 +549,12 @@ where
                         Err(InsertError::Retry(_)) | Err(InsertError::NodeFrozen(_)) => {}
                     };
                 } else {
-                    let len = unsafe { (*node).estimated_len(guard) };
-                    match unsafe { (*node).conditional_delete(status_word, value_index, guard) } {
+                    // no new value exists for key, caller want to remove KV
+                    let len = node.estimated_len(guard);
+                    match node.conditional_delete(status_word, kv_index, guard) {
                         Ok(_) => {
                             if self.should_merge(len - 1) {
-                                self.merge_recursive(key, guard);
+                                self.merge_recursive(&search_key, guard);
                             }
                             return true;
                         }
@@ -521,7 +562,40 @@ where
                     }
                 }
             } else {
-                return false;
+                // TODO: add possibility to insert KV if not exists
+                // Read status again and check that node didn't change.
+                // If it not changed, then we ensure that key doesn't find in node.
+                // If it changed, then we should restart and try to find key again.
+                // Other thread could start upsert operation for the same key concurrently while
+                // we are searching the key. This can cause situation when 'search/get' operation
+                // can miss the new value produced by upsert, but still observe removal of previous
+                // value(when upsert of new value completed).
+                // This race can lead to key doesn't exist error, but the tree actually contains
+                // such a key.
+                //
+                // Example:
+                // - node KVs: [(1,1),(2,2),(3,3),(4,4)]
+                // - get operation tries to obtain value for key '2'
+                // - concurrent upsert updates value for the same key '2'.
+                // Internally, node will looks like:
+                // [
+                //  sorted block: [(1,1)],
+                //  unsorted:[(2,2), (3,3), (4,4)]
+                // ]
+                // Let's imagine that get started to scan node(in order to find key '2') and
+                // already reached KV (3,3). At the same time, concurrent upsert reserves new
+                // entry for updated value and mark previous entry as deleted:
+                // [
+                //  sorted block: [(1,1)],
+                //  unsorted:[(2,2: deleted), (3,3), (4,4), (2, NEW_VAL_HERE)]
+                // ]
+                // After that thread which performs node scanning completes analyzing KV (3,3)
+                // and moves to the next KV. Here it sees that KV (2,2) marked as deleted.
+                let cur_status = node.status_word().read(guard);
+                if cur_status == status_word {
+                    return false;
+                }
+                // someone changed the node, we should retry
             }
         }
     }
@@ -531,109 +605,140 @@ where
         node_size <= self.node_size / 3
     }
 
-    fn merge_recursive<Q>(&self, key: &Q, guard: &Guard)
+    fn merge_recursive<Q>(&self, key: &Key<Q>, guard: &Guard)
     where
         K: Borrow<Q>,
         Q: Ord + Clone,
     {
+        let mut retries = 0;
         loop {
-            let path = self.find_node_for_key(key, guard);
-            match self.merge(path, guard) {
-                MergeResult::Completed => break,
-                MergeResult::Retry => {}
-                MergeResult::RecursiveMerge(path) => {
-                    // repeat until we try recursively merge parent nodes(until we find root
-                    // or some parent cannot be merged).
-                    let mut merge_path = path;
-                    while let MergeResult::RecursiveMerge(path) = self.merge(merge_path, guard) {
-                        merge_path = path;
+            if let Some(path) = self.find_path_to_key(key, false, guard) {
+                match self.merge_node(path, guard) {
+                    MergeResult::Completed => break,
+                    MergeResult::Retry => {
+                        retries += 1;
+                        if retries >= 3 {
+                            break;
+                        }
+                    }
+                    MergeResult::RecursiveMerge(path) => {
+                        // repeat until we try recursively merge parent nodes(until we find root
+                        // or some parent cannot be merged).
+                        retries = 0;
+                        let mut merge_path = path;
+                        while let MergeResult::RecursiveMerge(path) =
+                            self.merge_node(merge_path, guard)
+                        {
+                            merge_path = path;
+                        }
                     }
                 }
             }
         }
     }
 
-    fn merge<'g>(
+    fn merge_node<'g>(
         &'g self,
         mut path: TraversePath<'g, K, V>,
         guard: &'g Guard,
     ) -> MergeResult<'g, K, V> {
+        // obtain direct parent of merging node
         let parent = path.parents.pop();
         if parent.is_none() {
-            return self.merge_root(path.node_pointer, guard);
+            let result = self.merge_root(path.node_pointer, guard);
+            return result;
         }
 
-        // freeze node to ensure that no one can modify it
+        // freeze underflow node to ensure that no one can modify it
         if !path.node_pointer.try_froze() {
-            // this node can be:
-            // - already merged/split
-            // - replaced by new one(in case of interim nodes)
-            // - temporary frozen by 'merge with sibling' method
             return MergeResult::Retry;
         }
 
-        let mut unfroze_on_fail = vec![path.node_pointer.clone()];
-
         match path.node_pointer {
-            NodePointer::Leaf(node) => {
-                // between merge retries, node can receive new KVs and stopped being underutilized
+            Leaf(node) => {
+                // merge is not required anymore, node received new KVs
+                // while we tried to merge it
                 if !self.should_merge(node.estimated_len(guard)) {
-                    Self::unfroze(unfroze_on_fail);
+                    path.node_pointer.try_unfroze();
                     return MergeResult::Completed;
                 }
             }
-            NodePointer::Interim(_) => {
+            Interim(_) => {
                 // this is explicit request to merge interim node,
                 // always proceed with merge
             }
         };
 
+        // merging of underflow node with sibling will return 'new parent' node.
+        // This 'new parent' doesn't contain underutilized node and should be
+        // installed in grandparent node(by replacing 'current parent' node pointer with pointer
+        // to 'new parent' node).
         let parent = parent.unwrap();
-        // Parent node also should be frozen before merge, because we scan parent node KVs
-        // and copy them into new parent node. At the same time other thread can also
-        // merge other node and modify node pointers in our parent(other thread treat our
-        // parent as grandparent).
-        if !parent.node().try_froze(guard) {
-            Self::unfroze(unfroze_on_fail);
+        let parent_status = parent.node().status_word().read(guard);
+        if parent_status.is_frozen() {
+            path.node_pointer.try_unfroze();
             return MergeResult::Retry;
         }
-        unfroze_on_fail.push(parent.node_pointer.clone());
 
-        // if node became empty and parent has no links to other nodes and this is not a special
-        // +Inf node, we should remove parent from grandparent.
-        if parent.node().estimated_len(guard) <= 1
-            && path.node_pointer.len(guard) == 0
-            && parent.child_key != Key::pos_infinite()
-        {
-            return self.remove_empty_parent(&path, &parent, unfroze_on_fail, guard);
-        }
-
-        let new_parent = {
-            // merge with sibling will return new parent node. This new parent doesn't contain
-            // underutilized node. This new parent node should be installed in grandparent node
-            // by replacing current parent node pointer with pointer to new parent node.
-            if parent.node().estimated_len(guard) <= 1 {
-                // no siblings in parent node, try to merge parent with sibling on it's level.
-                Self::unfroze(unfroze_on_fail);
-                return MergeResult::RecursiveMerge(TraversePath {
+        // if no siblings in parent node
+        if parent.node().estimated_len(guard) <= 1 {
+            path.node_pointer.try_unfroze();
+            return if path.node_pointer.len(guard) == 0 {
+                // underflow node is empty and parent doesn't contain any other nodes,
+                // we can remove empty parent node from the tree
+                self.remove_empty_parent(
+                    TraversePath {
+                        parents: path.parents,
+                        node_pointer: parent.node_pointer,
+                        cas_pointer: parent.cas_pointer,
+                    },
+                    NodeDrop::new(),
+                    guard,
+                )
+            } else {
+                // underflow node cannot be merged with siblings, try to merge parent with it
+                // sibling on their level. This give a chance later to merge current underflow node
+                // with sibling node from another parent.
+                MergeResult::RecursiveMerge(TraversePath {
                     cas_pointer: parent.cas_pointer,
                     node_pointer: parent.node_pointer,
                     parents: path.parents,
-                });
-            }
+                })
+            };
+        }
 
-            match self.merge_with_sibling(path.node_pointer, &parent, &mut unfroze_on_fail, guard) {
-                Ok(new_parent) => new_parent,
-                Err(e) => {
-                    Self::unfroze(unfroze_on_fail);
-                    return e;
-                }
+        let mut drop = NodeDrop::new();
+        let mut mwcas = MwCas::new();
+        // merge underflow node with one of its siblings
+        let merge_res = self.merge_with_sibling(
+            path.node_pointer,
+            &parent,
+            parent_status,
+            &mut mwcas,
+            &mut drop,
+            guard,
+        );
+        let new_parent = match merge_res {
+            Ok(new_parent) => new_parent,
+            Err(e) => {
+                path.node_pointer.try_unfroze();
+                return e;
             }
         };
 
-        let merge_new_parent = self.should_merge(new_parent.estimated_len(guard));
+        // check that parent node is also underflow and should be merged on it's own level
+        let new_parent_should_merge = self.should_merge(new_parent.estimated_len(guard));
 
-        let mut mwcas = MwCas::new();
+        mwcas.compare_exchange(
+            parent.node().status_word(),
+            parent_status,
+            parent_status.froze(),
+        );
+        mwcas.compare_exchange(
+            parent.cas_pointer,
+            parent.node_pointer,
+            NodePointer::new_interim(new_parent),
+        );
         // if parent node has grandparent node, then check that grandparent not frozen.
         // if parent node has no grandparent node, then parent is current root, we can simply CAS
         // on root pointer.
@@ -643,29 +748,27 @@ where
                 // grandparent merged/split in progress, rollback changes and retry
                 // when parent node will be moved to new grandparent
                 // or this grandparent will be unfrozen
-                Self::unfroze(unfroze_on_fail);
+                path.node_pointer.try_unfroze();
                 return MergeResult::Retry;
             }
-
+            // check that grandparent is not frozen and increase it version
+            // (because we make in-place update of link to parent node)
             mwcas.compare_exchange(
                 grand_parent.node().status_word(),
                 status_word,
-                status_word.clone(),
+                status_word.inc_version(),
             );
         }
-        mwcas.compare_exchange(
-            parent.cas_pointer,
-            parent.node_pointer,
-            NodePointer::new_interim(new_parent),
-        );
 
         // merge prepared, try to install new nodes instead of underutilized
         if mwcas.exec(guard) {
             // we successfully merge node, now check is it parent become underutilized.
             // we try to merge parent only after original node merged, this will provide
             // bottom-up merge until we reach root.
-
-            if merge_new_parent {
+            drop.add(path.node_pointer.clone());
+            drop.add(parent.node_pointer.clone());
+            drop.exec(guard);
+            if new_parent_should_merge {
                 let new_parent_ptr = parent.cas_pointer.read(guard);
                 return MergeResult::RecursiveMerge(TraversePath {
                     cas_pointer: parent.cas_pointer,
@@ -675,7 +778,7 @@ where
             }
             MergeResult::Completed
         } else {
-            Self::unfroze(unfroze_on_fail);
+            path.node_pointer.try_unfroze();
             MergeResult::Retry
         }
     }
@@ -687,84 +790,127 @@ where
     /// new grandparent inside tree.
     fn remove_empty_parent(
         &self,
-        path_to_node: &TraversePath<K, V>,
-        parent: &Parent<K, V>,
-        mut unfroze_on_fail: Vec<NodePointer<K, V>>,
+        mut empty_node_path: TraversePath<K, V>,
+        mut drop: NodeDrop<K, V>,
         guard: &Guard,
     ) -> MergeResult<K, V> {
-        if let Some(gparent) = path_to_node.parents.last() {
-            let gparent_node = gparent.node_pointer.to_interim_node();
-            if !gparent_node.try_froze(guard) {
-                Self::unfroze(unfroze_on_fail);
+        let mut mwcas = MwCas::new();
+        let node_status = empty_node_path.node_pointer.status_word().read(guard);
+        if node_status.is_frozen() {
+            return MergeResult::Retry;
+        }
+
+        drop.add(empty_node_path.node_pointer.clone());
+        mwcas.compare_exchange(
+            empty_node_path.node_pointer.status_word(),
+            node_status,
+            node_status.froze(),
+        );
+
+        if let Some(parent_handle) = empty_node_path.parents.pop() {
+            let parent_node = parent_handle.node_pointer.to_interim_node();
+            let parent_status = parent_node.status_word().read(guard);
+            if parent_status.is_frozen() {
                 return MergeResult::Retry;
             }
-            unfroze_on_fail.push(gparent.node_pointer.clone());
+            // Parent node contains 1 node which should be removed because it empty.
+            // We should recursively process this parent node because logically it empty. Then we
+            // found some grandparent node which is not empty, we remove all empty nodes from it.
+            // This will release all empty nodes found below it.
+            if parent_node.estimated_len(guard) == 1 {
+                return self.remove_empty_parent(
+                    TraversePath {
+                        parents: empty_node_path.parents,
+                        cas_pointer: parent_handle.cas_pointer,
+                        node_pointer: parent_handle.node_pointer,
+                    },
+                    drop,
+                    guard,
+                );
+            }
 
-            let new_node = InterimNode::new_readonly(
-                gparent_node
-                    .iter(guard)
-                    .filter_map(|(k, v)| {
-                        if k != &gparent.child_key {
-                            Some((k.clone(), v.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-            );
-            let mut mwcas = MwCas::new();
+            drop.add(parent_handle.node_pointer.clone());
             mwcas.compare_exchange(
-                gparent.cas_pointer,
-                gparent.node_pointer,
+                parent_node.status_word(),
+                parent_status,
+                parent_status.froze(),
+            );
+
+            // if parent node has grandparent node, then check that grandparent not frozen.
+            if let Some(grand_parent) = empty_node_path.parents.last() {
+                let status_word = grand_parent.node().status_word().read(guard);
+                if status_word.is_frozen() {
+                    // grandparent merged/split in progress, rollback changes and retry
+                    // when parent node will be moved to new grandparent
+                    // or this grandparent will be unfrozen
+                    return MergeResult::Retry;
+                }
+
+                mwcas.compare_exchange(
+                    grand_parent.node().status_word(),
+                    status_word,
+                    status_word.inc_version(),
+                );
+            }
+
+            // create copy of parent node without link to empty child
+            let new_node = InterimNode::new_readonly(
+                parent_node.clone_with_filter(|(k, _)| *k != &parent_handle.child_key, guard),
+            );
+
+            mwcas.compare_exchange(
+                parent_handle.cas_pointer,
+                parent_handle.node_pointer,
                 NodePointer::new_interim(new_node),
             );
-            if mwcas.exec(guard) {
-                MergeResult::Completed
-            } else {
-                Self::unfroze(unfroze_on_fail);
-                MergeResult::Retry
-            }
         } else {
             // Parent node is root and it contains only 1 link to empty child node, replace root
-            // node by empty leaf node.Parent node already frozen at this moment, simply replace
+            // node by empty leaf node. Parent node already frozen at this moment, simply replace
             // old parent by new root node.
-            let mut mwcas = MwCas::new();
             mwcas.compare_exchange(
-                parent.cas_pointer,
-                parent.node_pointer,
+                empty_node_path.cas_pointer,
+                empty_node_path.node_pointer,
                 NodePointer::new_leaf(LeafNode::with_capacity(self.node_size as u16)),
             );
-            if mwcas.exec(guard) {
-                MergeResult::Completed
-            } else {
-                Self::unfroze(unfroze_on_fail);
-                MergeResult::Retry
-            }
+        }
+
+        if mwcas.exec(guard) {
+            drop.exec(guard);
+            MergeResult::Completed
+        } else {
+            MergeResult::Retry
         }
     }
 
     fn merge_root(&self, root_ptr: &NodePointer<K, V>, guard: &Guard) -> MergeResult<K, V> {
         let mut cur_root = root_ptr;
         loop {
-            if let NodePointer::Interim(root) = cur_root {
+            if let Interim(root) = cur_root {
                 let root_status = root.status_word().read(guard);
+                if root_status.is_frozen() || root.estimated_len(guard) != 1 {
+                    break;
+                }
                 // if root contains only 1 node, move this node up to root level
-                if !root_status.is_frozen() && root.estimated_len(guard) == 1 {
-                    let (_, child_ptr) = root.iter(guard).next().unwrap();
-                    let child_node_pointer = child_ptr.read(guard);
-                    let child_status = child_node_pointer.status_word().read(guard);
-                    let mut mwcas = MwCas::new();
-                    mwcas.compare_exchange(&root.status_word(), root_status, root_status.froze());
-                    mwcas.compare_exchange(
-                        child_node_pointer.status_word(),
-                        child_status,
-                        child_status.clone(),
-                    );
-                    mwcas.compare_exchange(&self.root, cur_root, child_node_pointer.clone());
-                    if !child_status.is_frozen() && mwcas.exec(guard) {
-                        cur_root = self.root.read(guard);
-                        continue;
-                    }
+                let (_, child_ptr) = root.iter(guard).next().unwrap();
+                let child_node_pointer = child_ptr.read(guard);
+                let child_status = child_node_pointer.status_word().read(guard);
+                if child_status.is_frozen() {
+                    break;
+                }
+                let mut mwcas = MwCas::new();
+                mwcas.compare_exchange(root.status_word(), root_status, root_status.froze());
+                mwcas.compare_exchange(
+                    child_node_pointer.status_word(),
+                    child_status,
+                    child_status.clone(),
+                );
+                mwcas.compare_exchange(&self.root, cur_root, child_node_pointer.clone());
+                if mwcas.exec(guard) {
+                    let mut drop = NodeDrop::new();
+                    drop.add(cur_root.clone());
+                    drop.exec(guard);
+                    cur_root = self.root.read(guard);
+                    continue;
                 }
             }
             break;
@@ -777,50 +923,58 @@ where
         &self,
         node: &'g NodePointer<K, V>,
         parent: &'g Parent<'g, K, V>,
-        unfroze_on_fail: &mut Vec<NodePointer<K, V>>,
+        parent_status: &StatusWord,
+        mwcas: &mut MwCas<'g>,
+        drop: &mut NodeDrop<K, V>,
         guard: &'g Guard,
     ) -> Result<InterimNode<K, V>, MergeResult<K, V>> {
-        let mut siblings: Vec<(Key<K>, &NodePointer<K, V>)> = Vec::with_capacity(2);
+        let mut siblings: Vec<(&Key<K>, &NodePointer<K, V>)> = Vec::with_capacity(2);
         let node_key = &parent.child_key;
-        let sibling_array = parent.node().get_siblings(&node_key, guard);
-        for i in 0..sibling_array.len() {
-            if let Some((key, sibling)) = sibling_array[i] {
-                siblings.push((key.clone(), sibling.read(guard)));
-            }
+        let sibling_array = parent.node().get_siblings(node_key, guard);
+        if parent.node().status_word().read(guard) != parent_status {
+            // parent changed, found siblings can be invalid, retry
+            return Err(MergeResult::Retry);
         }
 
-        let mut merged_siblings = Vec::with_capacity(2);
-        let mut merged = None;
+        for (key, sibling) in sibling_array.iter().flatten() {
+            siblings.push((key, sibling.read(guard)));
+        }
+
+        let mut merged_sibling_key: Option<&Key<K>> = None;
+        let mut merged: Option<(&Key<K>, NodePointer<K, V>)> = None;
         for (sibling_key, sibling) in &siblings {
-            if !sibling.try_froze() {
-                // sibling can be temporary frozen by merge attempt of other thread(which an fail)
-                continue;
+            let sibling_status = sibling.status_word().read(guard);
+            if sibling_status.is_frozen() {
+                // sibling is frozen by merge in other thread, retry merge again because parent
+                // already changed and current merge will fail.
+                return Err(MergeResult::Retry);
             }
 
             // try merge node with sibling
             match node {
-                NodePointer::Leaf(node) => match sibling {
-                    NodePointer::Leaf(other) => {
-                        match node.merge_with_leaf(other, self.node_size, guard) {
-                            MergeMode::NewNode(merged_node) => {
-                                let node_key = std::cmp::max(&parent.child_key, sibling_key);
-                                let node_ptr = NodePointer::new_leaf(merged_node);
-                                merged = Some((node_key, node_ptr));
-                                merged_siblings.push(sibling_key);
-                                unfroze_on_fail.push((*sibling).clone());
-                                break;
-                            }
-                            MergeMode::MergeFailed => {
-                                sibling.try_unfroze();
-                            }
+                Leaf(node) => match sibling {
+                    Leaf(other) => match node.merge_with_leaf(other, self.node_size, guard) {
+                        MergeMode::NewNode(merged_node) => {
+                            let node_key = std::cmp::max(&parent.child_key, sibling_key);
+                            let node_ptr = NodePointer::new_leaf(merged_node);
+                            merged = Some((node_key, node_ptr));
+                            merged_sibling_key = Some(*sibling_key);
+                            mwcas.compare_exchange(
+                                sibling.status_word(),
+                                sibling_status,
+                                sibling_status.froze(),
+                            );
+                            drop.add((*sibling).clone());
+                            break;
                         }
-                    }
-                    NodePointer::Interim(_) => {
+                        MergeMode::MergeFailed => {}
+                    },
+                    Interim(_) => {
                         panic!("Can't merge leaf with interim node")
                     }
                 },
-                NodePointer::Interim(node) => match sibling {
-                    NodePointer::Interim(other) => {
+                Interim(node) => match sibling {
+                    Interim(other) => {
                         match node.merge_with_interim(
                             other,
                             node.estimated_len(guard) + other.estimated_len(guard),
@@ -830,55 +984,46 @@ where
                                 let node_key = std::cmp::max(&parent.child_key, sibling_key);
                                 let node_ptr = NodePointer::new_interim(merged_node);
                                 merged = Some((node_key, node_ptr));
-                                merged_siblings.push(sibling_key);
-                                unfroze_on_fail.push((*sibling).clone());
+                                merged_sibling_key = Some(*sibling_key);
+                                mwcas.compare_exchange(
+                                    sibling.status_word(),
+                                    sibling_status,
+                                    sibling_status.froze(),
+                                );
+                                drop.add((*sibling).clone());
                                 break;
                             }
-                            MergeMode::MergeFailed => {
-                                sibling.try_unfroze();
-                            }
+                            MergeMode::MergeFailed => {}
                         }
                     }
-                    NodePointer::Leaf(_) => panic!("Can't merge interim node with leaf node"),
+                    Leaf(_) => panic!("Can't merge interim node with leaf node"),
                 },
             }
         }
 
-        if merged_siblings.is_empty() && merged.is_none() {
-            // no empty siblings found and no siblings have enough space to be merged
+        if merged.is_none() {
+            // no siblings have enough space to be merged
             return Err(MergeResult::Completed);
         }
 
-        // merge completed or compacted(some empty siblings removed):
+        let (new_node_key, new_node_ptr) = merged.unwrap();
+        let merged_sibling_key = merged_sibling_key.unwrap();
         // create new parent node with merged node and without empty/merged siblings.
-        let mut buffer = Vec::with_capacity(
-            parent.node().estimated_len(guard)
-                - merged_siblings.len()
-                - merged.as_ref().map_or_else(|| 0, |_| 1),
-        );
-        let underutilized_node_key = &parent.child_key;
-        for (key, val) in parent.node().iter(guard) {
-            if key == underutilized_node_key {
-                if let Some((key, node_ptr)) = &merged {
-                    // replace underutilized node by merged one
-                    buffer.push(((*key).clone(), HeapPointer::new(node_ptr.clone())));
-                } else {
-                    // node was not merged, copy as is
-                    buffer.push((key.clone(), HeapPointer::new(val.read(guard).clone())));
-                }
-            } else if !merged_siblings.contains(&key) {
-                // remove merged siblings
-                buffer.push((key.clone(), HeapPointer::new(val.read(guard).clone())));
+        let mut buffer = Vec::with_capacity(parent.node().estimated_len(guard) - 1);
+        let merged_node_key = &parent.child_key;
+        for (key, val) in parent.node().clone_content(guard) {
+            if &key == merged_node_key {
+                // replace underutilized node by merged one
+                buffer.push((
+                    (*new_node_key).clone(),
+                    HeapPointer::new(new_node_ptr.clone()),
+                ));
+            } else if &key != merged_sibling_key {
+                // remove merged sibling from parent node
+                buffer.push((key, val));
             }
         }
         Ok(InterimNode::new_readonly(buffer))
-    }
-
-    #[inline(always)]
-    fn unfroze(nodes: Vec<NodePointer<K, V>>) {
-        for node in nodes {
-            node.try_unfroze();
-        }
     }
 
     fn split_leaf(&self, path_to_leaf: TraversePath<K, V>, guard: &Guard) {
@@ -897,21 +1042,21 @@ where
         mut path: TraversePath<'g, K, V>,
         guard: &'g Guard,
     ) -> Option<TraversePath<'g, K, V>> {
-        if !path.node_pointer.try_froze() {
-            // someone already try to split/merge node
-            return None;
-        }
-
         let parent = path.parents.pop();
         if parent.is_none() {
             self.split_root(path.node_pointer, guard);
             return None;
         }
 
+        if !path.node_pointer.try_froze() {
+            // someone already try to split/merge node
+            return None;
+        }
+
         // freeze node to ensure that no one can modify it during split
         let parent = parent.unwrap();
-        if !parent.node().try_froze(guard) {
-            // someone already try to split/merge node
+        let parent_status = parent.node().status_word().read(guard);
+        if parent_status.is_frozen() {
             path.node_pointer.try_unfroze();
             return None;
         }
@@ -922,18 +1067,24 @@ where
                 // node was split: create new parent which links to 2 new children which replace
                 // original overflow node
                 let mut mwcas = MwCas::new();
+                mwcas.compare_exchange(
+                    parent.node().status_word(),
+                    parent_status,
+                    parent_status.froze(),
+                );
                 if let Some(grand_parent) = path.parents.last() {
                     let status = grand_parent.node().status_word().read(guard);
                     if !status.is_frozen() {
+                        // check that grandparent is not frozen and increase it version
+                        // (because we make in-place update of link to parent node)
                         mwcas.compare_exchange(
                             grand_parent.node().status_word(),
                             status,
-                            status.clone(),
+                            status.inc_version(),
                         );
                     } else {
                         // retry split again
                         path.node_pointer.try_unfroze();
-                        parent.node().try_unfroze(guard);
                         return None;
                     }
                 }
@@ -943,7 +1094,11 @@ where
                 mwcas.compare_exchange(parent.cas_pointer, parent.node_pointer, new_parent);
                 if !mwcas.exec(guard) {
                     path.node_pointer.try_unfroze();
-                    parent.node().try_unfroze(guard);
+                } else {
+                    let mut drop = NodeDrop::new();
+                    drop.add(path.node_pointer.clone());
+                    drop.add(parent.node_pointer.clone());
+                    drop.exec(guard);
                 }
                 None
             }
@@ -951,17 +1106,24 @@ where
                 // node overflow caused by too many updates => replace overflow node
                 // with new compacted node which can accept more elements
                 let mut mwcas = MwCas::new();
+                mwcas.compare_exchange(
+                    parent.node().status_word(),
+                    parent_status,
+                    parent_status.inc_version(),
+                );
                 mwcas.compare_exchange(path.cas_pointer, path.node_pointer, compacted_node);
                 if !mwcas.exec(guard) {
                     path.node_pointer.try_unfroze();
+                } else {
+                    let mut drop = NodeDrop::new();
+                    drop.add(path.node_pointer.clone());
+                    drop.exec(guard);
                 }
-                parent.node().try_unfroze(guard);
                 None
             }
             SplitResult::ParentOverflow => {
                 // parent node is full and should be split before we can insert new child
                 path.node_pointer.try_unfroze();
-                parent.node().try_unfroze(guard);
                 Some(TraversePath {
                     cas_pointer: parent.cas_pointer,
                     node_pointer: parent.node_pointer,
@@ -972,12 +1134,12 @@ where
     }
 
     fn split_root(&self, root: &NodePointer<K, V>, guard: &Guard) {
-        // must be already frozen
-        let root_status = root.status_word().read(guard);
-        debug_assert!(root_status.is_frozen());
+        if !root.try_froze() {
+            return;
+        }
 
         let new_root = match root {
-            NodePointer::Leaf(cur_root) => {
+            Leaf(cur_root) => {
                 match cur_root.split_leaf(guard) {
                     SplitMode::Split(left, right) => {
                         // greatest key of left node moved to parent as split point
@@ -1007,7 +1169,7 @@ where
                     SplitMode::Compact(compacted_root) => NodePointer::new_leaf(compacted_root),
                 }
             }
-            NodePointer::Interim(cur_root) => {
+            Interim(cur_root) => {
                 match cur_root.split_interim(guard) {
                     SplitMode::Split(left, right) => {
                         let left_key = left
@@ -1035,14 +1197,19 @@ where
 
         let mut mwcas = MwCas::new();
         mwcas.compare_exchange(&self.root, root, new_root);
-        let res = mwcas.exec(guard);
-        debug_assert!(res);
+        if mwcas.exec(guard) {
+            let mut drop = NodeDrop::new();
+            drop.add(root.clone());
+            drop.exec(guard);
+        } else {
+            debug_assert!(false);
+        }
     }
 
     fn try_split_node(
         &self,
         node: &NodePointer<K, V>,
-        underflow_node_key: &Key<K>,
+        overflow_node_key: &Key<K>,
         parent_node: &InterimNode<K, V>,
         guard: &Guard,
     ) -> SplitResult<K, V> {
@@ -1050,7 +1217,7 @@ where
         #[inline(always)]
         fn new_parent<K, V>(
             parent_node: &InterimNode<K, V>,
-            underflow_node_key: &Key<K>,
+            overflow_node_key: &Key<K>,
             left_key: Key<K>,
             left_child: NodePointer<K, V>,
             right_child: NodePointer<K, V>,
@@ -1067,16 +1234,16 @@ where
             }
 
             let mut sorted_elems = Vec::with_capacity(node_len + 1);
-            for (key, val) in parent_node.iter(&guard) {
+            for (key, val) in parent_node.clone_content(guard) {
                 // overflowed node found inside parent, replace it by 2 new nodes
-                if underflow_node_key == key {
+                if overflow_node_key == &key {
                     sorted_elems.push((left_key.clone(), HeapPointer::new(left_child.clone())));
                     sorted_elems.push((
-                        underflow_node_key.clone(),
+                        overflow_node_key.clone(),
                         HeapPointer::new(right_child.clone()),
                     ));
                 } else {
-                    sorted_elems.push((key.clone(), val.clone()));
+                    sorted_elems.push((key, val));
                 }
             }
 
@@ -1084,7 +1251,7 @@ where
         }
 
         match node {
-            NodePointer::Leaf(leaf) => match leaf.split_leaf(guard) {
+            Leaf(leaf) => match leaf.split_leaf(guard) {
                 SplitMode::Split(left, right) => {
                     let left_key = left
                         .last_kv(guard)
@@ -1093,7 +1260,7 @@ where
                         .clone();
                     if let Some(new_parent) = new_parent(
                         parent_node,
-                        underflow_node_key,
+                        overflow_node_key,
                         Key::new(left_key),
                         NodePointer::new_leaf(left),
                         NodePointer::new_leaf(right),
@@ -1109,7 +1276,7 @@ where
                     SplitResult::Compacted(NodePointer::new_leaf(compacted_node))
                 }
             },
-            NodePointer::Interim(interim) => match interim.split_interim(guard) {
+            Interim(interim) => match interim.split_interim(guard) {
                 SplitMode::Split(left, right) => {
                     let left_key = left
                         .last_kv(guard)
@@ -1118,7 +1285,7 @@ where
                         .clone();
                     if let Some(new_parent) = new_parent(
                         parent_node,
-                        underflow_node_key,
+                        overflow_node_key,
                         left_key,
                         NodePointer::new_interim(left),
                         NodePointer::new_interim(right),
@@ -1137,124 +1304,168 @@ where
         }
     }
 
-    /// Find node(with traversal path from root) which can contain passed key
-    fn find_node_for_key<'g, Q>(
+    /// Find leaf node which can contain passed key
+    fn find_leaf_for_key<'g, Q>(
         &'g self,
-        search_key: &Q,
+        search_key: &Key<Q>,
+        create_node_for_key: bool,
         guard: &'g Guard,
-    ) -> TraversePath<'g, K, V>
+    ) -> Option<&'g LeafNode<K, V>>
     where
         K: Borrow<Q>,
-        Q: Clone + Ord,
+        Q: Ord + Clone,
     {
-        let search_key = Key::new(search_key.clone());
-        self.find_path_to_key(&search_key, guard)
+        let mut next_node: &NodeLink<K, V> = &self.root;
+        loop {
+            next_node = match next_node.read(guard) {
+                Interim(node) => {
+                    if let Some((_, child_node_ptr)) = node.closest(search_key, guard) {
+                        child_node_ptr
+                    } else if create_node_for_key {
+                        // slow path
+                        return self
+                            .find_path_to_key(search_key, create_node_for_key, guard)
+                            .map(|path| path.node_pointer.to_leaf_node());
+                    } else {
+                        return None;
+                    }
+                }
+                Leaf(node) => {
+                    return Some(node);
+                }
+            }
+        }
     }
 
-    /// Find node(with traversal path from root) which can contain passed key
+    /// Find leaf node(with traversal path from root) which can contain passed key.
+    /// If no node exists which can contain passed key, it can be created using
+    /// `create_pos_inf_node_if_not_exists` flag.
     fn find_path_to_key<'g, Q>(
         &'g self,
         search_key: &Key<Q>,
+        create_node_for_key: bool,
         guard: &'g Guard,
-    ) -> TraversePath<'g, K, V>
+    ) -> Option<TraversePath<'g, K, V>>
     where
         K: Borrow<Q>,
         Q: Ord,
     {
         let mut parents = Vec::new();
-        let mut next_node: &HeapPointer<NodePointer<K, V>> = &self.root;
+        let mut next_node: &NodeLink<K, V> = &self.root;
         loop {
             next_node = match next_node.read(guard) {
-                parent_pointer @ NodePointer::Interim(_) => {
-                    let (child_node_key, child_node_ptr) = parent_pointer
-                        .to_interim_node()
-                        .closest(&search_key, guard)
-                        .expect("+Inf node should always exists in tree");
-                    parents.push(Parent {
-                        cas_pointer: next_node,
-                        node_pointer: parent_pointer,
-                        child_key: child_node_key.clone(),
-                    });
-                    child_node_ptr
+                node_pointer @ Interim(node) => {
+                    if let Some((child_node_key, child_node_ptr)) = node.closest(search_key, guard)
+                    {
+                        // found node which can contain the key
+                        parents.push(Parent {
+                            cas_pointer: next_node,
+                            node_pointer,
+                            child_key: child_node_key.clone(),
+                        });
+                        child_node_ptr
+                    } else if create_node_for_key {
+                        // No place found for the key, we need to grow the tree.
+                        // Greatest element of interim node will serve as +Inf node to
+                        // accommodate new KV.
+                        self.insert_pos_inf_node(
+                            TraversePath {
+                                cas_pointer: next_node,
+                                node_pointer,
+                                parents,
+                            },
+                            guard,
+                        );
+                        // tree is changed, restart from root
+                        parents = Vec::new();
+                        &self.root
+                    } else {
+                        return None;
+                    }
                 }
-                leaf_pointer @ NodePointer::Leaf(_) => {
-                    return TraversePath {
+                leaf_pointer @ Leaf(_) => {
+                    return Some(TraversePath {
                         cas_pointer: next_node,
                         node_pointer: leaf_pointer,
                         parents,
-                    };
+                    });
                 }
             }
         }
     }
 
-    /// Find leaf node which can contain passed key
-    fn find_leaf_mut<'g, Q>(
-        &'g mut self,
-        search_key: &Q,
+    /// When interim node doesn't contains +Inf node and client tries to insert key which is
+    /// greater than any other key in the tree, we should update interim's node which
+    /// contains link to leaf with greatest element. This update will replace key of greatest
+    /// element in interim node by +Inf key. This updated interim can now accept new keys which
+    /// are greater than other keys of the tree.
+    fn insert_pos_inf_node<'g>(&'g self, mut path: TraversePath<K, V>, guard: &'g Guard) -> bool {
+        let parent = Parent {
+            child_key: Key::pos_infinite(), // key is ignored in this context
+            node_pointer: path.node_pointer,
+            cas_pointer: path.cas_pointer,
+        };
+        path.parents.push(parent);
+
+        let mut drop = NodeDrop::new();
+        // update key of greatest node to +Inf on all levels of tree
+        let mut mwcas = MwCas::new();
+        for interim in path.parents {
+            let node = interim.node_pointer.to_interim_node();
+            let status_word = node.status_word().read(guard);
+            if status_word.is_frozen() {
+                return false;
+            }
+            mwcas.compare_exchange(
+                interim.node_pointer.status_word(),
+                status_word,
+                status_word.inc_version(),
+            );
+
+            let mut cloned_kvs = node.clone_content(guard);
+            cloned_kvs.last_mut().unwrap().0 = Key::pos_infinite();
+            let new_interim = InterimNode::new_readonly(cloned_kvs);
+            // update link in parent node to new interim node
+            drop.add(interim.node_pointer.clone());
+            mwcas.compare_exchange(
+                interim.cas_pointer,
+                interim.node_pointer,
+                NodePointer::new_interim(new_interim),
+            );
+        }
+
+        if mwcas.exec(guard) {
+            drop.exec(guard);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return leaf node which contains max known key of the tree. Also return key in parent node
+    /// which points to this leaf(or `None` if this is root node).
+    fn find_edge_node<'g, Q>(
+        &'g self,
+        node_edge: NodeEdge,
         guard: &'g Guard,
-    ) -> &'g mut LeafNode<K, V>
+    ) -> (&'g LeafNode<K, V>, Option<&'g Key<K>>)
     where
         K: Borrow<Q>,
-        Q: Clone + Ord,
+        Q: Ord,
     {
-        let search_key = Key::new(search_key.clone());
-        let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
+        let mut next_node: (&NodeLink<K, V>, Option<&Key<K>>) = (&self.root, None);
         loop {
-            next_node = match next_node {
-                NodePointer::Interim(node) => {
-                    let (_, child_node_ptr) = node
-                        .closest_mut(&search_key, guard)
-                        .expect("+Inf node should always exists in tree");
-                    child_node_ptr.read_mut(guard)
-                }
-                NodePointer::Leaf(node) => {
-                    return node;
-                }
-            }
-        }
-    }
+            next_node = match next_node.0.read(guard) {
+                Interim(node) => {
+                    let (key, child_node_ptr) = node
+                        .edge_kv(node_edge, guard)
+                        .map(|e| (e.key, e.value))
+                        .expect("Tree never contains empty interim nodes");
 
-    /// Find leaf node which can contain passed key
-    fn find_leaf<'g, Q>(&'g self, search_key: &Q, guard: &'g Guard) -> &'g LeafNode<K, V>
-    where
-        K: Borrow<Q>,
-        Q: Clone + Ord,
-    {
-        let search_key = Key::new(search_key.clone());
-        let mut next_node: &NodePointer<K, V> = self.root.read(guard);
-        loop {
-            next_node = match next_node {
-                NodePointer::Interim(node) => {
-                    let (_, child_node_ptr) = node
-                        .closest(&search_key, guard)
-                        .expect("+Inf node should always exists in tree");
-                    child_node_ptr.read(guard)
+                    (child_node_ptr, Some(key))
                 }
-                NodePointer::Leaf(node_ref) => {
-                    return node_ref;
-                }
-            }
-        }
-    }
-
-    fn find_leaf_ptr<'g, Q>(&'g mut self, search_key: &Q, guard: &'g Guard) -> *mut LeafNode<K, V>
-    where
-        K: Borrow<Q>,
-        Q: Ord + Clone,
-    {
-        let search_key = Key::new(search_key.clone());
-        let mut next_node: &mut NodePointer<K, V> = self.root.read_mut(guard);
-        loop {
-            next_node = match next_node {
-                NodePointer::Interim(node) => {
-                    let (_, child_node_ptr) = node
-                        .closest_mut(&search_key, guard)
-                        .expect("+Inf node should always exists in tree");
-                    child_node_ptr.read_mut(guard)
-                }
-                NodePointer::Leaf(node_ref) => {
-                    return node_ref.deref_mut() as *mut LeafNode<K, V>;
+                Leaf(node) => {
+                    return (node, next_node.1);
                 }
             }
         }
@@ -1285,28 +1496,36 @@ enum SplitResult<K: Ord, V> {
 
 struct TraversePath<'g, K: Ord, V> {
     /// Node pointer of this node inside parent(used by MwCAS).
-    cas_pointer: &'g HeapPointer<NodePointer<K, V>>,
+    cas_pointer: &'g NodeLink<K, V>,
     /// Pointer to found node inside tree(read from CAS pointer during traversal)
     node_pointer: &'g NodePointer<K, V>,
     /// Chain of parents including root node(starts from root, vector end is most closest parent)
     parents: Vec<Parent<'g, K, V>>,
 }
 
-struct ArcLeafNode<K: Ord, V> {
-    ref_cnt: *mut AtomicUsize,
+#[repr(transparent)]
+struct LeafNodeRef<K: Ord, V> {
     node: *mut LeafNode<K, V>,
 }
 
-impl<K: Ord, V> ArcLeafNode<K, V> {
+impl<K: Ord, V> LeafNodeRef<K, V> {
     fn new(leaf: LeafNode<K, V>) -> Self {
-        ArcLeafNode {
-            ref_cnt: Box::into_raw(Box::new(AtomicUsize::new(1))),
+        LeafNodeRef {
             node: Box::into_raw(Box::new(leaf)),
+        }
+    }
+
+    fn drop_manual(self, guard: &Guard) {
+        unsafe {
+            let node = Box::from_raw(self.node);
+            guard.defer_unchecked(move || {
+                drop(node);
+            });
         }
     }
 }
 
-impl<K: Ord, V> Deref for ArcLeafNode<K, V> {
+impl<K: Ord, V> Deref for LeafNodeRef<K, V> {
     type Target = LeafNode<K, V>;
 
     fn deref(&self) -> &Self::Target {
@@ -1314,55 +1533,44 @@ impl<K: Ord, V> Deref for ArcLeafNode<K, V> {
     }
 }
 
-impl<K: Ord, V> DerefMut for ArcLeafNode<K, V> {
+impl<K: Ord, V> DerefMut for LeafNodeRef<K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.node }
     }
 }
 
-impl<K: Ord, V> Clone for ArcLeafNode<K, V> {
+impl<K: Ord, V> Clone for LeafNodeRef<K, V> {
     fn clone(&self) -> Self {
-        unsafe {
-            let prev = (*self.ref_cnt).fetch_add(1, Ordering::AcqRel);
-            debug_assert!(prev > 0);
-        }
-        ArcLeafNode {
-            ref_cnt: self.ref_cnt,
-            node: self.node,
-        }
+        LeafNodeRef { node: self.node }
     }
 }
 
-impl<K: Ord, V> Drop for ArcLeafNode<K, V> {
-    fn drop(&mut self) {
-        unsafe {
-            let prev = (*self.ref_cnt).fetch_sub(1, Ordering::AcqRel);
-            if prev == 1 {
-                drop(Box::from_raw(self.ref_cnt));
-                drop(Box::from_raw(self.node));
-            }
-        }
-    }
-}
+unsafe impl<K: Ord, V> Send for LeafNodeRef<K, V> {}
+unsafe impl<K: Ord, V> Sync for LeafNodeRef<K, V> {}
 
-unsafe impl<K: Ord, V> Send for ArcLeafNode<K, V> {}
-unsafe impl<K: Ord, V> Sync for ArcLeafNode<K, V> {}
-
-struct ArcInterimNode<K: Ord, V> {
-    ref_cnt: *mut AtomicUsize,
+#[repr(transparent)]
+struct InterimNodeRef<K: Ord, V> {
     node: *mut InterimNode<K, V>,
 }
 
-impl<K: Ord, V> ArcInterimNode<K, V> {
+impl<K: Ord, V> InterimNodeRef<K, V> {
     fn new(interim: InterimNode<K, V>) -> Self {
-        ArcInterimNode {
-            ref_cnt: Box::into_raw(Box::new(AtomicUsize::new(1))),
+        InterimNodeRef {
             node: Box::into_raw(Box::new(interim)),
+        }
+    }
+
+    fn drop_manual(self, guard: &Guard) {
+        unsafe {
+            let node = Box::from_raw(self.node);
+            guard.defer_unchecked(move || {
+                drop(node);
+            });
         }
     }
 }
 
-impl<K: Ord, V> Deref for ArcInterimNode<K, V> {
+impl<K: Ord, V> Deref for InterimNodeRef<K, V> {
     type Target = InterimNode<K, V>;
 
     fn deref(&self) -> &Self::Target {
@@ -1370,75 +1578,104 @@ impl<K: Ord, V> Deref for ArcInterimNode<K, V> {
     }
 }
 
-impl<K: Ord, V> DerefMut for ArcInterimNode<K, V> {
+impl<K: Ord, V> DerefMut for InterimNodeRef<K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.node }
     }
 }
 
-impl<K: Ord, V> Clone for ArcInterimNode<K, V> {
+impl<K: Ord, V> Clone for InterimNodeRef<K, V> {
     fn clone(&self) -> Self {
-        unsafe {
-            let prev = (*self.ref_cnt).fetch_add(1, Ordering::AcqRel);
-            debug_assert!(prev > 0);
-        }
-        ArcInterimNode {
-            ref_cnt: self.ref_cnt,
-            node: self.node,
-        }
+        InterimNodeRef { node: self.node }
     }
 }
 
-impl<K: Ord, V> Drop for ArcInterimNode<K, V> {
-    fn drop(&mut self) {
-        unsafe {
-            let prev = (*self.ref_cnt).fetch_sub(1, Ordering::AcqRel);
-            if prev == 1 {
-                drop(Box::from_raw(self.ref_cnt));
-                drop(Box::from_raw(self.node));
+unsafe impl<K: Ord, V> Send for InterimNodeRef<K, V> {}
+unsafe impl<K: Ord, V> Sync for InterimNodeRef<K, V> {}
+
+struct NodeDrop<K: Ord, V> {
+    nodes: Vec<NodePointer<K, V>>,
+}
+
+impl<K: Ord, V> NodeDrop<K, V> {
+    fn new() -> Self {
+        NodeDrop {
+            nodes: Vec::with_capacity(2),
+        }
+    }
+
+    fn add(&mut self, node: NodePointer<K, V>) {
+        self.nodes.push(node);
+    }
+
+    fn exec(self, guard: &Guard) {
+        for node in self.nodes {
+            match node {
+                NodePointer::Interim(node) => node.drop_manual(guard),
+                NodePointer::Leaf(node) => node.drop_manual(guard),
             }
         }
     }
 }
 
-unsafe impl<K: Ord, V> Send for ArcInterimNode<K, V> {}
-unsafe impl<K: Ord, V> Sync for ArcInterimNode<K, V> {}
-
 enum NodePointer<K: Ord, V> {
-    Leaf(ArcLeafNode<K, V>),
-    Interim(ArcInterimNode<K, V>),
+    Leaf(LeafNodeRef<K, V>),
+    Interim(InterimNodeRef<K, V>),
 }
 
-impl<K: Ord + Clone, V> Clone for NodePointer<K, V> {
+impl<K: Ord, V> Clone for NodePointer<K, V> {
     fn clone(&self) -> Self {
         match self {
-            NodePointer::Leaf(node) => NodePointer::Leaf(node.clone()),
-            NodePointer::Interim(node) => NodePointer::Interim(node.clone()),
+            Leaf(node) => Leaf(node.clone()),
+            Interim(node) => Interim(node.clone()),
         }
     }
 }
 
 unsafe impl<K: Ord, V> Send for NodePointer<K, V> {}
+
 unsafe impl<K: Ord, V> Sync for NodePointer<K, V> {}
+
+impl<K: Ord, V> From<InterimNodeRef<K, V>> for NodePointer<K, V> {
+    fn from(node: InterimNodeRef<K, V>) -> Self {
+        Interim(node)
+    }
+}
 
 impl<K: Ord, V> NodePointer<K, V> {
     #[inline]
     fn new_leaf(node: LeafNode<K, V>) -> NodePointer<K, V> {
-        let leaf_node = ArcLeafNode::new(node);
-        NodePointer::Leaf(leaf_node)
+        let leaf_node = LeafNodeRef::new(node);
+        Leaf(leaf_node)
     }
 
     #[inline]
     fn new_interim(node: InterimNode<K, V>) -> NodePointer<K, V> {
-        let interim_node = ArcInterimNode::new(node);
-        NodePointer::Interim(interim_node)
+        let interim_node = InterimNodeRef::new(node);
+        Interim(interim_node)
+    }
+
+    #[inline]
+    fn points_to_leaf(&self, node_ptr: &LeafNode<K, V>) -> bool {
+        match self {
+            Interim(_) => false,
+            Leaf(node) => ptr::eq(node.node, node_ptr),
+        }
     }
 
     #[inline]
     fn to_interim_node(&self) -> &InterimNode<K, V> {
         match self {
-            NodePointer::Interim(node) => node,
-            NodePointer::Leaf(_) => panic!("Pointer points to leaf node"),
+            Interim(node) => node,
+            Leaf(_) => panic!("Pointer points to leaf node"),
+        }
+    }
+
+    #[inline]
+    fn to_leaf_node(&self) -> &LeafNode<K, V> {
+        match self {
+            Interim(_) => panic!("Pointer points to interim node"),
+            Leaf(node) => node,
         }
     }
 
@@ -1448,8 +1685,8 @@ impl<K: Ord, V> NodePointer<K, V> {
         K: Ord,
     {
         match self {
-            NodePointer::Leaf(node) => node.exact_len(guard),
-            NodePointer::Interim(node) => node.estimated_len(guard),
+            Leaf(node) => node.exact_len(guard),
+            Interim(node) => node.estimated_len(guard),
         }
     }
 
@@ -1457,8 +1694,8 @@ impl<K: Ord, V> NodePointer<K, V> {
     fn try_froze(&self) -> bool {
         let guard = crossbeam_epoch::pin();
         match self {
-            NodePointer::Leaf(node) => node.try_froze(&guard),
-            NodePointer::Interim(node) => node.try_froze(&guard),
+            Leaf(node) => node.try_froze(&guard),
+            Interim(node) => node.try_froze(&guard),
         }
     }
 
@@ -1466,16 +1703,16 @@ impl<K: Ord, V> NodePointer<K, V> {
     fn try_unfroze(&self) -> bool {
         let guard = crossbeam_epoch::pin();
         match self {
-            NodePointer::Leaf(node) => node.try_unfroze(&guard),
-            NodePointer::Interim(node) => node.try_unfroze(&guard),
+            Leaf(node) => node.try_unfroze(&guard),
+            Interim(node) => node.try_unfroze(&guard),
         }
     }
 
     #[inline]
     fn status_word(&self) -> &HeapPointer<StatusWord> {
         match self {
-            NodePointer::Leaf(node) => node.status_word(),
-            NodePointer::Interim(node) => node.status_word(),
+            Leaf(node) => node.status_word(),
+            Interim(node) => node.status_word(),
         }
     }
 }
@@ -1546,7 +1783,7 @@ impl<K: Borrow<Q>, Q: Eq> PartialEq<Key<Q>> for Key<K> {
 
 struct Parent<'a, K: Ord, V> {
     /// Node pointer of this parent inside grandparent(used by MwCAS).
-    cas_pointer: &'a HeapPointer<NodePointer<K, V>>,
+    cas_pointer: &'a NodeLink<K, V>,
     /// Parent node pointer inside grandparent at moment of tree traversal(actual value read from
     /// cas_pointer at some moment in time).
     node_pointer: &'a NodePointer<K, V>,
@@ -1562,13 +1799,14 @@ impl<'a, K: Ord, V> Parent<'a, K, V> {
 
 #[cfg(test)]
 mod tests {
+    use rand::{thread_rng, Rng};
     use std::borrow::Borrow;
     use std::fmt::{Debug, Display, Formatter};
 
     use crate::BzTree;
 
     #[test]
-    fn insert() {
+    fn insert_min_sized_node() {
         let tree = BzTree::with_node_size(2);
         tree.insert(Key::new("1"), "1", &crossbeam_epoch::pin());
         tree.insert(Key::new("2"), "2", &crossbeam_epoch::pin());
@@ -1578,10 +1816,57 @@ mod tests {
         assert!(matches!(tree.get(&"1", &guard), Some(&"1")));
         assert!(matches!(tree.get(&"2", &guard), Some(&"2")));
         assert!(matches!(tree.get(&"3", &guard), Some(&"3")));
+
+        let tree = BzTree::with_node_size(2);
+        tree.insert(Key::new("1"), "1", &crossbeam_epoch::pin());
+        tree.insert(Key::new("2"), "2", &crossbeam_epoch::pin());
+
+        let guard = crossbeam_epoch::pin();
+        assert!(matches!(tree.get(&"1", &guard), Some(&"1")));
+        assert!(matches!(tree.get(&"2", &guard), Some(&"2")));
+        assert!(matches!(tree.iter(&guard).count(), 2));
     }
 
     #[test]
-    fn upsert() {
+    fn insert_full_nodess() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+
+                    assert!(matches!(
+                        tree.get(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.get(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upsert_min_sized_node() {
         let tree = BzTree::with_node_size(2);
         tree.upsert(Key::new("1"), "1", &crossbeam_epoch::pin());
         tree.upsert(Key::new("2"), "2", &crossbeam_epoch::pin());
@@ -1591,25 +1876,240 @@ mod tests {
         assert!(matches!(tree.get(&"1", &guard), Some(&"1")));
         assert!(matches!(tree.get(&"2", &guard), Some(&"2")));
         assert!(matches!(tree.get(&"3", &guard), Some(&"3")));
+
+        let tree = BzTree::with_node_size(2);
+        tree.upsert(Key::new("1"), "1", &crossbeam_epoch::pin());
+        tree.upsert(Key::new("2"), "2", &crossbeam_epoch::pin());
+
+        let guard = crossbeam_epoch::pin();
+        assert!(matches!(tree.get(&"1", &guard), Some(&"1")));
+        assert!(matches!(tree.get(&"2", &guard), Some(&"2")));
+        assert!(matches!(tree.iter(&guard).count(), 2));
     }
 
     #[test]
-    fn delete() {
-        let tree = BzTree::with_node_size(2);
-        tree.insert(Key::new("1"), "1", &crossbeam_epoch::pin());
-        tree.insert(Key::new("2"), "2", &crossbeam_epoch::pin());
-        tree.insert(Key::new("3"), "3", &crossbeam_epoch::pin());
+    fn upsert_full_nodess() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.upsert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
 
-        let guard = crossbeam_epoch::pin();
-        assert!(matches!(tree.delete(&"1", &guard), Some(&"1")));
-        assert!(matches!(tree.delete(&"2", &guard), Some(&"2")));
-        assert!(matches!(tree.delete(&"3", &guard), Some(&"3")));
+                    assert!(matches!(
+                        tree.get(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
 
-        assert!(tree.iter(&guard).next().is_none());
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.get(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+            }
+        }
+    }
 
-        assert!(tree.get(&"1", &guard).is_none());
-        assert!(tree.get(&"2", &guard).is_none());
-        assert!(tree.get(&"3", &guard).is_none());
+    #[test]
+    fn forward_delete() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                }
+
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn backward_delete() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                }
+
+                for i in (0..size * i).rev() {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn delete_from_midpoint() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                }
+
+                let vec = (0..(size * i) as usize).collect::<Vec<usize>>();
+                let (left, right) = vec.split_at((size * i / 2) as usize);
+
+                let mut left_iter = left.iter().rev();
+                let mut right_iter = right.iter().rev();
+                loop {
+                    let next = if thread_rng().gen_bool(0.5) {
+                        left_iter.next().or_else(|| right_iter.next())
+                    } else {
+                        right_iter.next().or_else(|| left_iter.next())
+                    };
+                    if next.is_none() {
+                        break;
+                    }
+
+                    let i = next.unwrap();
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn delete_to_midpoint() {
+        let nodes = 5;
+        for i in 1..=nodes {
+            for size in [
+                2,
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+                thread_rng().gen_range(3..500),
+            ] {
+                let tree = BzTree::with_node_size(size);
+                for i in 0..size * i {
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    tree.insert(
+                        Key::new(expected_key.clone()),
+                        expected_val.clone(),
+                        &crossbeam_epoch::pin(),
+                    );
+                }
+
+                let vec = (0..(size * i) as usize).collect::<Vec<usize>>();
+                let (left, right) = vec.split_at((size * i / 2) as usize);
+
+                let mut left_iter = left.iter();
+                let mut right_iter = right.iter();
+                loop {
+                    let next = if thread_rng().gen_bool(0.5) {
+                        left_iter.next().or_else(|| right_iter.next())
+                    } else {
+                        right_iter.next().or_else(|| left_iter.next())
+                    };
+                    if next.is_none() {
+                        break;
+                    }
+
+                    let i = next.unwrap();
+                    let expected_key = i.to_string();
+                    let expected_val = i.to_string();
+                    assert!(matches!(
+                        tree.delete(&expected_key, &crossbeam_epoch::pin()),
+                        Some(val) if val == &expected_val
+                    ));
+                }
+
+                assert_eq!(tree.iter(&crossbeam_epoch::pin()).count(), 0);
+            }
+        }
     }
 
     #[test]
@@ -1975,113 +2475,155 @@ mod tests {
 
     #[test]
     fn first() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        tree.insert(Key::new("1"), "1", &guard);
-        tree.insert(Key::new("2"), "2", &guard);
-        tree.insert(Key::new("3"), "3", &guard);
-        tree.insert(Key::new("4"), "4", &guard);
-        tree.insert(Key::new("5"), "5", &guard);
-        tree.insert(Key::new("6"), "6", &guard);
-        tree.insert(Key::new("7"), "7", &guard);
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            tree.insert(Key::new("1"), "1", &guard);
+            tree.insert(Key::new("2"), "2", &guard);
+            tree.insert(Key::new("3"), "3", &guard);
+            tree.insert(Key::new("4"), "4", &guard);
+            tree.insert(Key::new("5"), "5", &guard);
+            tree.insert(Key::new("6"), "6", &guard);
+            tree.insert(Key::new("7"), "7", &guard);
 
-        assert!(matches!(tree.first(&guard), Some((k, _)) if k == &Key::new("1")));
+            assert!(matches!(tree.first(&guard), Some((k, _)) if k == &Key::new("1")));
 
-        tree.delete(&"1", &guard);
-        tree.delete(&"2", &guard);
-        tree.delete(&"3", &guard);
+            tree.delete(&"1", &guard);
+            tree.delete(&"2", &guard);
+            tree.delete(&"3", &guard);
 
-        assert!(matches!(tree.first(&guard), Some((k, _)) if k == &Key::new("4")));
+            assert!(matches!(tree.first(&guard), Some((k, _)) if k == &Key::new("4")));
+        }
     }
 
     #[test]
     fn last() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        tree.insert(Key::new("1"), "1", &guard);
-        tree.insert(Key::new("2"), "2", &guard);
-        tree.insert(Key::new("3"), "3", &guard);
-        tree.insert(Key::new("4"), "4", &guard);
-        tree.insert(Key::new("5"), "5", &guard);
-        tree.insert(Key::new("6"), "6", &guard);
-        tree.insert(Key::new("7"), "7", &guard);
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            tree.insert(Key::new("1"), "1", &guard);
+            tree.insert(Key::new("2"), "2", &guard);
+            tree.insert(Key::new("3"), "3", &guard);
+            tree.insert(Key::new("4"), "4", &guard);
+            tree.insert(Key::new("5"), "5", &guard);
+            tree.insert(Key::new("6"), "6", &guard);
+            tree.insert(Key::new("7"), "7", &guard);
 
-        assert!(matches!(tree.last(&guard), Some((k, _)) if k == &Key::new("7")));
+            assert!(matches!(tree.last(&guard), Some((k, _)) if k == &Key::new("7")));
 
-        tree.delete(&"5", &guard);
-        tree.delete(&"6", &guard);
-        tree.delete(&"7", &guard);
+            tree.delete(&"5", &guard);
+            tree.delete(&"6", &guard);
+            tree.delete(&"7", &guard);
 
-        assert!(matches!(tree.last(&guard), Some((k, _)) if k == &Key::new("4")));
+            assert!(matches!(tree.last(&guard), Some((k, _)) if k == &Key::new("4")));
+        }
     }
 
     #[test]
     fn pop_first() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        let count = 55;
-        for i in 0..count {
-            tree.insert(Key::new(i), i, &guard);
-        }
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            let count = size * thread_rng().gen_range(1..5) + thread_rng().gen_range(0..size);
+            for i in 0..count {
+                tree.insert(Key::new(i), i, &guard);
+            }
 
-        for i in 0..count {
-            assert!(matches!(tree.pop_first(&guard), Some((k, _)) if k == Key::new(i)));
-        }
+            for i in 0..count {
+                assert!(matches!(tree.pop_first(&guard), Some((k, _)) if k == Key::new(i)));
+            }
 
-        assert!(tree.iter(&guard).next().is_none());
+            assert!(tree.iter(&guard).next().is_none());
+        }
     }
 
     #[test]
     fn pop_last() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        let count = 55;
-        for i in 0..count {
-            tree.insert(Key::new(i), i, &guard);
-        }
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            let count = size * thread_rng().gen_range(1..5) + thread_rng().gen_range(0..size);
+            for i in 0..count {
+                tree.insert(Key::new(i), i, &guard);
+            }
 
-        for i in (0..count).rev() {
-            assert!(matches!(tree.pop_last(&guard), Some((k, _)) if k == Key::new(i)));
-        }
+            for i in (0..count).rev() {
+                assert!(matches!(tree.pop_last(&guard), Some((k, _)) if k == Key::new(i)));
+            }
 
-        assert!(tree.iter(&guard).next().is_none());
+            assert!(tree.iter(&guard).next().is_none());
+        }
     }
 
     #[test]
     fn conditional_insert() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        let count = 55;
-        for i in 0..count {
-            tree.insert(Key::new(i), i, &guard);
-        }
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            let count = size * thread_rng().gen_range(1..5) + thread_rng().gen_range(0..size);
+            for i in 0..count {
+                tree.insert(Key::new(i), i, &guard);
+            }
 
-        for i in 0..count {
-            assert!(tree.compute(&i, |(_, v)| Some(v + 1), &guard));
-        }
+            for i in 0..count {
+                assert!(tree.compute(&i, |(_, v)| Some(v + 1), &guard));
+            }
 
-        for i in 0..count {
-            assert_eq!(*tree.get(&i, &guard).unwrap(), i + 1);
-        }
+            for i in 0..count {
+                assert_eq!(*tree.get(&i, &guard).unwrap(), i + 1);
+            }
 
-        assert!(!tree.compute(&(count + 1), |(_, v)| Some(v + 1), &guard));
+            assert!(!tree.compute(&(count + 1), |(_, v)| Some(v + 1), &guard));
+        }
     }
 
     #[test]
     fn conditional_remove() {
-        let tree = BzTree::with_node_size(2);
-        let guard = crossbeam_epoch::pin();
-        let count = 55;
-        for i in 0..count {
-            tree.insert(Key::new(i), i, &guard);
-        }
+        for size in [
+            2,
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+            thread_rng().gen_range(3..500),
+        ] {
+            let tree = BzTree::with_node_size(size);
+            let guard = crossbeam_epoch::pin();
+            let count = size * thread_rng().gen_range(1..5) + thread_rng().gen_range(0..size);
+            for i in 0..count {
+                tree.insert(Key::new(i), i, &guard);
+            }
 
-        for i in 0..count {
-            assert!(tree.compute(&i, |(_, _)| None, &guard));
-        }
+            for i in 0..count {
+                assert!(tree.compute(&i, |(_, _)| None, &guard));
+            }
 
-        for i in 0..count {
-            assert!(matches!(tree.get(&i, &guard), None));
+            for i in 0..count {
+                assert!(matches!(tree.get(&i, &guard), None));
+            }
         }
     }
 
