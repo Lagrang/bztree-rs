@@ -519,12 +519,13 @@ where
         loop {
             let node = self.find_leaf_for_key(&search_key, false, guard);
             if node.is_none() {
-                println!("!");
                 return false;
             }
 
             let node = node.unwrap();
-            if let Some((found_key, val, status_word, value_index)) = node.get(key, guard) {
+            let status_word = node.status_word().read(guard);
+            if let Some((found_key, val, kv_index)) = node.conditional_get(key, status_word, guard)
+            {
                 // compute new value for key
                 if let Some(new_val) = new_val((found_key, val)) {
                     match node.conditional_upsert(found_key.clone(), new_val, status_word, guard) {
@@ -550,7 +551,7 @@ where
                 } else {
                     // no new value exists for key, caller want to remove KV
                     let len = node.estimated_len(guard);
-                    match node.conditional_delete(status_word, value_index, guard) {
+                    match node.conditional_delete(status_word, kv_index, guard) {
                         Ok(_) => {
                             if self.should_merge(len - 1) {
                                 self.merge_recursive(&search_key, guard);
@@ -562,8 +563,39 @@ where
                 }
             } else {
                 // TODO: add possibility to insert KV if not exists
-                println!("!!");
-                return false;
+                // Read status again and check that node didn't change.
+                // If it not changed, then we ensure that key doesn't find in node.
+                // If it changed, then we should restart and try to find key again.
+                // Other thread could start upsert operation for the same key concurrently while
+                // we are searching the key. This can cause situation when 'search/get' operation
+                // can miss the new value produced by upsert, but still observe removal of previous
+                // value(when upsert of new value completed).
+                // This race can lead to key doesn't exist error, but the tree actually contains
+                // such a key.
+                //
+                // Example:
+                // - node KVs: [(1,1),(2,2),(3,3),(4,4)]
+                // - get operation tries to obtain value for key '2'
+                // - concurrent upsert updates value for the same key '2'.
+                // Internally, node will looks like:
+                // [
+                //  sorted block: [(1,1)],
+                //  unsorted:[(2,2), (3,3), (4,4)]
+                // ]
+                // Let's imagine that get started to scan node(in order to find key '2') and
+                // already reached KV (3,3). At the same time, concurrent upsert reserves new
+                // entry for updated value and mark previous entry as deleted:
+                // [
+                //  sorted block: [(1,1)],
+                //  unsorted:[(2,2: deleted), (3,3), (4,4), (2, NEW_VAL_HERE)]
+                // ]
+                // After that thread which performs node scanning completes analyzing KV (3,3)
+                // and moves to the next KV. Here it sees that KV (2,2) marked as deleted.
+                let cur_status = node.status_word().read(guard);
+                if cur_status == status_word {
+                    return false;
+                }
+                // someone changed the node, we should retry
             }
         }
     }

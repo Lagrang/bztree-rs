@@ -14,6 +14,7 @@ use std::fmt::{Display, Formatter};
 use std::mem::MaybeUninit;
 use std::ops::RangeBounds;
 use std::option::Option::Some;
+use std::sync::atomic;
 use std::{mem, ptr};
 
 /// BzTree node.
@@ -133,12 +134,8 @@ impl<K: Ord, V> Node<K, V> {
         K: Ord,
         V: Send + Sync,
     {
-        debug_assert!(!self.readonly);
         let cur_status = self.status_word.read(guard);
-        match self.insert_phase_one(key, value, true, cur_status, guard) {
-            Ok(reserved_entry) => self.insert_phase_two(reserved_entry, true, guard),
-            Err(e) => Err(e),
-        }
+        self.conditional_upsert(key, value, cur_status, guard)
     }
 
     /// Upsert value associated with passed key if node wasn't changed(status word is same).
@@ -270,6 +267,23 @@ impl<K: Ord, V> Node<K, V> {
             .map_or_else(
                 |_| None,
                 |(key, val, val_index)| Some((key, val, status_word, val_index)),
+            )
+    }
+
+    pub fn conditional_get<'g, Q>(
+        &'g self,
+        key: &Q,
+        status_word: &StatusWord,
+        guard: &'g Guard,
+    ) -> Option<(&'g K, &'g V, usize)>
+    where
+        K: Borrow<Q>,
+        Q: Ord,
+    {
+        self.get_internal(key, status_word, true, guard)
+            .map_or_else(
+                |_| None,
+                |(key, val, val_index)| Some((key, val, val_index)),
             )
     }
 
@@ -408,6 +422,8 @@ impl<K: Ord, V> Node<K, V> {
                 let entry = &self.data_block[index];
                 let metadata: Metadata = entry.metadata.read(guard).into();
                 if metadata.is_visible() {
+                    // read the key only after we ensured that entry is valid, otherwise key can
+                    // point to uninitialized memory
                     let key = unsafe { entry.key() };
                     unsorted_edge = unsorted_edge
                         .map(|edge_kv| {
@@ -748,14 +764,19 @@ impl<K: Ord, V> Node<K, V> {
                 // until reserved entry will become valid
             };
 
-            let entry_key = unsafe { entry.key() };
             if metadata.is_visible() {
+                // read the key only after we ensured that entry is valid, otherwise key can
+                // point to uninitialized memory
+                let entry_key = unsafe { entry.key() };
                 if entry_key.borrow() == key {
                     return Ok((entry_key, unsafe { entry.value() }, index));
                 }
-            } else if metadata.is_deleted() && entry_key.borrow() == key {
-                // most recent state of key indicates that it was deleted
-                return Err(SearchError::KeyNotFound);
+            } else if metadata.is_deleted() {
+                let entry_key = unsafe { entry.key() };
+                if entry_key.borrow() == key {
+                    // most recent state of key indicates that it was deleted
+                    return Err(SearchError::KeyNotFound);
+                }
             }
         }
 
@@ -858,7 +879,7 @@ impl<K: Ord, V> Node<K, V> {
             }
         }
 
-        // Complete write of KV into reserved entry, returns replaced entry, if this is an upsert.
+        // Complete write of KV into reserved entry.
         let index = new_entry.index;
         let reserved_metadata: Metadata = self.data_block[index].metadata.read(guard).into();
         debug_assert!(reserved_metadata.is_reserved());
@@ -874,6 +895,8 @@ impl<K: Ord, V> Node<K, V> {
                 .value
                 .as_mut_ptr()
                 .write_volatile(new_entry.value);
+            // ensure that all written data can be seen by other threads
+            atomic::fence(atomic::Ordering::SeqCst);
         }
 
         loop {
@@ -881,6 +904,10 @@ impl<K: Ord, V> Node<K, V> {
             if current_status.is_frozen() {
                 // no one seen this KV yet, move out it from node
                 self.clear_reserved_entry(index, guard);
+                unsafe {
+                    mem::replace(&mut self_mut.data_block[index].key, MaybeUninit::uninit())
+                        .assume_init();
+                }
                 let value = unsafe {
                     mem::replace(&mut self_mut.data_block[index].value, MaybeUninit::uninit())
                         .assume_init()
@@ -889,35 +916,39 @@ impl<K: Ord, V> Node<K, V> {
             }
 
             let mut mwcas = MwCas::new();
-            // ensure that node is not frozen during MWCAS
-            // or status word changed by other insertion/deletion/split/merge.
-            mwcas.compare_exchange(&self.status_word, current_status, current_status.clone());
             mwcas.compare_exchange_u64(
                 &self.data_block[index].metadata,
                 reserved_metadata.into(),
                 Metadata::visible().into(),
             );
+
+            let mut new_status = current_status.clone();
             // mark existing KV as 'deleted' if it will be overwritten by upsert operation
-            if let Some(index) = new_entry.overwritten_entry {
-                let entry = &mut self_mut.data_block[index];
-                let metadata: Metadata = entry.metadata.read(guard).into();
+            if let Some(existing_entry_index) = new_entry.overwritten_entry {
+                let existing_entry = &mut self_mut.data_block[existing_entry_index];
+                let metadata: Metadata = existing_entry.metadata.read(guard).into();
                 // No need to check that metadata is still visible here.
                 // If someone already removed this existing entry, this will be catch by status
                 // word CAS.
                 mwcas.compare_exchange_u64(
-                    &entry.metadata,
+                    &existing_entry.metadata,
                     metadata.into(),
                     Metadata::deleted().into(),
                 );
+                new_status = new_status.delete_entry();
             }
 
+            // ensure that node is not frozen during MWCAS
+            // or status word changed by other insertion/deletion/split/merge.
+            mwcas.compare_exchange(&self.status_word, current_status, new_status);
+
             if mwcas.exec(guard) {
-                return if let Some(index) = new_entry.overwritten_entry {
+                return if let Some(existing_entry_index) = new_entry.overwritten_entry {
                     // drop value replaced by upsert
-                    let entry = &mut self_mut.data_block[index];
+                    let existing_entry = &mut self_mut.data_block[existing_entry_index];
                     unsafe {
-                        entry.defer_value_drop(guard);
-                        Ok(Some(entry.value()))
+                        existing_entry.defer_value_drop(guard);
+                        Ok(Some(existing_entry.value()))
                     }
                 } else {
                     Ok(None)
@@ -983,6 +1014,9 @@ impl<K: Ord, V> Drop for Node<K, V> {
         for entry in self.data_block.drain(..).rev() {
             let metadata: Metadata = entry.metadata.read(guard).into();
             unsafe {
+                if metadata.is_visible() || metadata.is_deleted() {
+                    drop(entry.key.assume_init());
+                }
                 if metadata.is_visible() {
                     drop(entry.value.assume_init());
                 }
@@ -1032,16 +1066,25 @@ struct Entry<K, V> {
 }
 
 impl<K, V> Entry<K, V> {
+    /// Read the key part of entry.
+    /// *Warning*: before reading the key reference, caller should ensure that entry is valid.
+    /// Otherwise, key can points to uninitialized memory.
     #[inline(always)]
     unsafe fn key(&self) -> &K {
         &*self.key.as_ptr()
     }
 
+    /// Read the value part of entry.
+    /// *Warning*: before reading the value reference, caller should ensure that entry is valid.
+    /// Otherwise, value can points to uninitialized memory.
     #[inline(always)]
     unsafe fn value(&self) -> &V {
         &*self.value.as_ptr()
     }
 
+    /// Read the value part of entry.
+    /// *Warning*: before reading the value reference, caller should ensure that entry is valid.
+    /// Otherwise, value can points to uninitialized memory.
     #[inline(always)]
     unsafe fn value_mut(&mut self) -> &mut V {
         &mut *self.value.as_mut_ptr()

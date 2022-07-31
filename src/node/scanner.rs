@@ -77,9 +77,13 @@ where
                     // until reserved entry will become valid
                 };
 
-                let key = unsafe { node.data_block[i].key() };
-                if metadata.is_visible() && key_range.contains(key.borrow()) {
-                    kvs.push(i as u16);
+                if metadata.is_visible() {
+                    // read the key only after we ensured that entry is valid, otherwise key can
+                    // point to uninitialized memory
+                    let key = unsafe { node.data_block[i].key() };
+                    if key_range.contains(key.borrow()) {
+                        kvs.push(i as u16);
+                    }
                 }
             }
 

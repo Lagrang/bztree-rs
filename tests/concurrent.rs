@@ -38,7 +38,7 @@ where
 #[test]
 fn insert_of_non_overlaping_keys_and_search() {
     test(
-        |size| BzTree::<String, usize>::with_node_size(size as u16),
+        |size| BzTree::<String, String>::with_node_size(size as u16),
         |tree, threads, shard_size: usize| {
             thread::scope(|scope| {
                 for id in 0..threads {
@@ -50,11 +50,11 @@ fn insert_of_non_overlaping_keys_and_search() {
                         for i in keys {
                             let guard = crossbeam_epoch::pin();
                             let key = i.to_string();
-                            let value = thread_rng().gen::<usize>();
+                            let value = thread_rng().gen::<usize>().to_string();
                             if thread_rng().gen_bool(0.5) {
-                                tree.insert(key.clone(), value, &guard);
+                                tree.insert(key.clone(), value.clone(), &guard);
                             } else {
-                                tree.upsert(key.clone(), value, &guard);
+                                tree.upsert(key.clone(), value.clone(), &guard);
                             }
 
                             let found_val = tree
@@ -73,7 +73,7 @@ fn insert_of_non_overlaping_keys_and_search() {
 #[test]
 fn upsert_of_overlaping_keys() {
     test(
-        |size| BzTree::<String, usize>::with_node_size(size as u16),
+        |size| BzTree::<String, String>::with_node_size(size as u16),
         |tree, threads, thread_changes_count| {
             let mut per_thread_elem_set = Vec::new();
             for _ in 0..threads {
@@ -93,8 +93,8 @@ fn upsert_of_overlaping_keys() {
                             let key = i.to_string();
                             let value = thread_rng().gen::<usize>();
                             let start = Instant::now();
-                            tree.upsert(key.clone(), value, &guard);
-                            ops.insert(key, value, start);
+                            tree.upsert(key.clone(), value.to_string(), &guard);
+                            ops.insert(key, value.to_string(), start);
                         }
                         ops
                     }));
@@ -120,7 +120,7 @@ fn upsert_of_overlaping_keys() {
 fn add_and_delete() {
     let max_val = 50;
     test(
-        |size| BzTree::<String, usize>::with_node_size(size as u16),
+        |size| BzTree::<String, String>::with_node_size(size as u16),
         |tree, threads, thread_changes| {
             let mut per_thread_elem_set = Vec::with_capacity(threads);
             for _ in 0..threads {
@@ -142,14 +142,18 @@ fn add_and_delete() {
                             let value = thread_rng().gen_range(1..100000);
                             let start = Instant::now();
                             if thread_rng().gen_bool(0.4) {
-                                tree.upsert(key.clone(), value, &guard);
-                                ops.insert(key, value, start);
+                                tree.upsert(key.clone(), value.to_string(), &guard);
+                                ops.insert(key, value.to_string(), start);
                             } else if thread_rng().gen_bool(0.3)
                                 && tree.delete(&key, &crossbeam_epoch::pin()).is_some()
                             {
                                 ops.delete(key.clone(), start);
-                            } else if tree.insert(key.clone(), value, &crossbeam_epoch::pin()) {
-                                ops.insert(key.clone(), value, start);
+                            } else if tree.insert(
+                                key.clone(),
+                                value.to_string(),
+                                &crossbeam_epoch::pin(),
+                            ) {
+                                ops.insert(key.clone(), value.to_string(), start);
                             }
                         }
                         ops
@@ -174,7 +178,7 @@ fn add_and_delete() {
 #[test]
 fn key_search() {
     test(
-        |size| BzTree::<String, usize>::with_node_size(size as u16),
+        |size| BzTree::<String, String>::with_node_size(size as u16),
         |tree, threads, changes| {
             thread::scope(|scope| {
                 let mut keys: Vec<usize> = (0..changes * threads).collect();
@@ -183,7 +187,7 @@ fn key_search() {
                     let guard = crossbeam_epoch::pin();
                     let key = i.to_string();
                     let value = i;
-                    tree.insert(key, value, &guard);
+                    tree.insert(key, value.to_string(), &guard);
                 }
 
                 for thread_id in 0..threads {
@@ -195,7 +199,7 @@ fn key_search() {
                             let found_val = tree
                                 .get(&key, &guard)
                                 .unwrap_or_else(|| panic!("{:?} not found", &key));
-                            assert_eq!(*found_val, i);
+                            assert_eq!(*found_val, i.to_string());
                         }
                     });
                 }
@@ -508,10 +512,10 @@ fn scan_with_deletes() {
 #[test]
 fn compute_with_value_update() {
     test(
-        |size| BzTree::<usize, usize>::with_node_size(size as u16),
+        |size| BzTree::<String, usize>::with_node_size(size as u16),
         |tree, threads, iters| {
             for i in 0..threads * 3 {
-                assert!(tree.insert(i, 0, &crossbeam_epoch::pin()));
+                assert!(tree.insert(i.to_string(), 0, &crossbeam_epoch::pin()));
             }
 
             let history = thread::scope(|scope| {
@@ -520,12 +524,12 @@ fn compute_with_value_update() {
                     handles.push(scope.spawn(|_| {
                         let mut ops = Ops::new();
                         for _ in 0..iters {
-                            let key = thread_rng().gen_range(0..threads * 3);
+                            let key = thread_rng().gen_range(0..threads * 3).to_string();
                             assert!(
                                 tree.compute(
                                     &key,
                                     |(_, v)| {
-                                        ops.insert(key, v + 1, Instant::now());
+                                        ops.insert(key.clone(), v + 1, Instant::now());
                                         Some(v + 1)
                                     },
                                     &crossbeam_epoch::pin()
@@ -554,7 +558,7 @@ fn compute_with_value_update() {
 #[test]
 fn compute_with_value_delete() {
     test(
-        |size| BzTree::<usize, usize>::with_node_size(size as u16),
+        |size| BzTree::<String, usize>::with_node_size(size as u16),
         |tree, threads, iters| {
             let history = thread::scope(|scope| {
                 let mut handles = Vec::new();
@@ -562,7 +566,7 @@ fn compute_with_value_delete() {
                     handles.push(scope.spawn(|_| {
                         let mut ops = Ops::new();
                         for _ in 0..iters {
-                            let key = thread_rng().gen_range(0..threads * 3);
+                            let key = thread_rng().gen_range(0..threads * 3).to_string();
                             if thread_rng().gen_bool(0.5) {
                                 let mut new_val: usize = 0;
                                 if tree.compute(
@@ -573,16 +577,16 @@ fn compute_with_value_delete() {
                                     },
                                     &crossbeam_epoch::pin(),
                                 ) {
-                                    ops.insert(key, new_val, Instant::now());
+                                    ops.insert(key.clone(), new_val, Instant::now());
                                 } else {
-                                    tree.insert(key, 0, &crossbeam_epoch::pin());
+                                    tree.insert(key.clone(), 0, &crossbeam_epoch::pin());
                                     ops.insert(key, 0, Instant::now());
                                 }
                             } else {
                                 if tree.compute(&key, |(_, _)| None, &crossbeam_epoch::pin()) {
-                                    ops.delete(key, Instant::now());
+                                    ops.delete(key.clone(), Instant::now());
                                 } else {
-                                    tree.insert(key, 0, &crossbeam_epoch::pin());
+                                    tree.insert(key.clone(), 0, &crossbeam_epoch::pin());
                                     ops.insert(key, 0, Instant::now());
                                 }
                             }
