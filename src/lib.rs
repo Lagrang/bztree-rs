@@ -650,7 +650,7 @@ where
         }
 
         // freeze underflow node to ensure that no one can modify it
-        if !path.node_pointer.try_froze() {
+        if !path.node_pointer.try_froze(guard) {
             return MergeResult::Retry;
         }
 
@@ -659,7 +659,7 @@ where
                 // merge is not required anymore, node received new KVs
                 // while we tried to merge it
                 if !self.should_merge(node.estimated_len(guard)) {
-                    path.node_pointer.try_unfroze();
+                    path.node_pointer.try_unfroze(guard);
                     return MergeResult::Completed;
                 }
             }
@@ -676,13 +676,13 @@ where
         let parent = parent.unwrap();
         let parent_status = parent.node().status_word().read(guard);
         if parent_status.is_frozen() {
-            path.node_pointer.try_unfroze();
+            path.node_pointer.try_unfroze(guard);
             return MergeResult::Retry;
         }
 
         // if no siblings in parent node
         if parent.node().estimated_len(guard) <= 1 {
-            path.node_pointer.try_unfroze();
+            path.node_pointer.try_unfroze(guard);
             return if path.node_pointer.len(guard) == 0 {
                 // underflow node is empty and parent doesn't contain any other nodes,
                 // we can remove empty parent node from the tree
@@ -721,7 +721,7 @@ where
         let new_parent = match merge_res {
             Ok(new_parent) => new_parent,
             Err(e) => {
-                path.node_pointer.try_unfroze();
+                path.node_pointer.try_unfroze(guard);
                 return e;
             }
         };
@@ -748,7 +748,7 @@ where
                 // grandparent merged/split in progress, rollback changes and retry
                 // when parent node will be moved to new grandparent
                 // or this grandparent will be unfrozen
-                path.node_pointer.try_unfroze();
+                path.node_pointer.try_unfroze(guard);
                 return MergeResult::Retry;
             }
             // check that grandparent is not frozen and increase it version
@@ -778,7 +778,7 @@ where
             }
             MergeResult::Completed
         } else {
-            path.node_pointer.try_unfroze();
+            path.node_pointer.try_unfroze(guard);
             MergeResult::Retry
         }
     }
@@ -1048,7 +1048,7 @@ where
             return None;
         }
 
-        if !path.node_pointer.try_froze() {
+        if !path.node_pointer.try_froze(guard) {
             // someone already try to split/merge node
             return None;
         }
@@ -1057,7 +1057,7 @@ where
         let parent = parent.unwrap();
         let parent_status = parent.node().status_word().read(guard);
         if parent_status.is_frozen() {
-            path.node_pointer.try_unfroze();
+            path.node_pointer.try_unfroze(guard);
             return None;
         }
 
@@ -1084,7 +1084,7 @@ where
                         );
                     } else {
                         // retry split again
-                        path.node_pointer.try_unfroze();
+                        path.node_pointer.try_unfroze(guard);
                         return None;
                     }
                 }
@@ -1093,7 +1093,7 @@ where
                 // or parent is a root node which should be replaced by new one
                 mwcas.compare_exchange(parent.cas_pointer, parent.node_pointer, new_parent);
                 if !mwcas.exec(guard) {
-                    path.node_pointer.try_unfroze();
+                    path.node_pointer.try_unfroze(guard);
                 } else {
                     let mut drop = NodeDrop::new();
                     drop.add(path.node_pointer.clone());
@@ -1113,7 +1113,7 @@ where
                 );
                 mwcas.compare_exchange(path.cas_pointer, path.node_pointer, compacted_node);
                 if !mwcas.exec(guard) {
-                    path.node_pointer.try_unfroze();
+                    path.node_pointer.try_unfroze(guard);
                 } else {
                     let mut drop = NodeDrop::new();
                     drop.add(path.node_pointer.clone());
@@ -1123,7 +1123,7 @@ where
             }
             SplitResult::ParentOverflow => {
                 // parent node is full and should be split before we can insert new child
-                path.node_pointer.try_unfroze();
+                path.node_pointer.try_unfroze(guard);
                 Some(TraversePath {
                     cas_pointer: parent.cas_pointer,
                     node_pointer: parent.node_pointer,
@@ -1134,7 +1134,7 @@ where
     }
 
     fn split_root(&self, root: &NodePointer<K, V>, guard: &Guard) {
-        if !root.try_froze() {
+        if !root.try_froze(guard) {
             return;
         }
 
@@ -1691,20 +1691,18 @@ impl<K: Ord, V> NodePointer<K, V> {
     }
 
     #[inline]
-    fn try_froze(&self) -> bool {
-        let guard = crossbeam_epoch::pin();
+    fn try_froze(&self, guard: &Guard) -> bool {
         match self {
-            Leaf(node) => node.try_froze(&guard),
-            Interim(node) => node.try_froze(&guard),
+            Leaf(node) => node.try_froze(guard),
+            Interim(node) => node.try_froze(guard),
         }
     }
 
     #[inline]
-    fn try_unfroze(&self) -> bool {
-        let guard = crossbeam_epoch::pin();
+    fn try_unfroze(&self, guard: &Guard) -> bool {
         match self {
-            Leaf(node) => node.try_unfroze(&guard),
-            Interim(node) => node.try_unfroze(&guard),
+            Leaf(node) => node.try_unfroze(guard),
+            Interim(node) => node.try_unfroze(guard),
         }
     }
 
