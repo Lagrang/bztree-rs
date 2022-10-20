@@ -748,33 +748,35 @@ impl<K: Ord, V> Node<K, V> {
         K: Borrow<Q>,
         Q: Ord,
     {
-        // scan unsorted part first because it contain most recent values
-        for index in (self.sorted_len..status_word.reserved_records() as usize).rev() {
-            let entry = &self.data_block[index];
-            let metadata = loop {
-                let metadata: Metadata = entry.metadata.read(guard).into();
-                if !metadata.is_reserved() {
-                    break metadata;
-                }
-                if !await_reserved_entries {
-                    return Err(SearchError::ReservedEntryFound);
-                }
-                // someone try to add entry at same time, continue check same entry
-                // until reserved entry will become valid
-            };
+        if status_word.reserved_records() as usize > self.sorted_len {
+            // scan unsorted part first because it contain most recent values
+            for index in (self.sorted_len..status_word.reserved_records() as usize).rev() {
+                let entry = &self.data_block[index];
+                let metadata = loop {
+                    let metadata: Metadata = entry.metadata.read(guard).into();
+                    if !metadata.is_reserved() {
+                        break metadata;
+                    }
+                    if !await_reserved_entries {
+                        return Err(SearchError::ReservedEntryFound);
+                    }
+                    // someone try to add entry at same time, continue check same entry
+                    // until reserved entry will become valid
+                };
 
-            if metadata.is_visible() {
-                // read the key only after we ensured that entry is valid, otherwise key can
-                // point to uninitialized memory
-                let entry_key = unsafe { entry.key() };
-                if entry_key.borrow() == key {
-                    return Ok((entry_key, unsafe { entry.value() }, index));
-                }
-            } else if metadata.is_deleted() {
-                let entry_key = unsafe { entry.key() };
-                if entry_key.borrow() == key {
-                    // most recent state of key indicates that it was deleted
-                    return Err(SearchError::KeyNotFound);
+                if metadata.is_visible() {
+                    // read the key only after we ensured that entry is valid, otherwise key can
+                    // point to uninitialized memory
+                    let entry_key = unsafe { entry.key() };
+                    if entry_key.borrow() == key {
+                        return Ok((entry_key, unsafe { entry.value() }, index));
+                    }
+                } else if metadata.is_deleted() {
+                    let entry_key = unsafe { entry.key() };
+                    if entry_key.borrow() == key {
+                        // most recent state of key indicates that it was deleted
+                        return Err(SearchError::KeyNotFound);
+                    }
                 }
             }
         }

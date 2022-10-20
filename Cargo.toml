@@ -1,6 +1,6 @@
 [package]
 name = "bztree"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Igor Skokov"]
 edition = "2018"
 license = "MIT"
@@ -13,7 +13,7 @@ categories = ["concurrency", "data-structures"]
 include = ["src/", "LICENSE", "README.md", "CHANGELOG.md"]
 
 [dependencies]
-mwcas = "0.1.0"
+mwcas = "0.2.0"
 crossbeam-epoch = "0.9.4"
 
 [dev-dependencies]

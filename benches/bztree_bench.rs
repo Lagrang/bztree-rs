@@ -9,6 +9,8 @@ use std::time::Instant;
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 pub fn concurrent(c: &mut Criterion) {
+    let cpus: usize = num_cpus::get() - 2;
+
     let mut group = c.benchmark_group("concurrent");
     group.throughput(Throughput::Elements(1));
     for node_size in (40..=100).step_by(20) {
@@ -22,7 +24,6 @@ pub fn concurrent(c: &mut Criterion) {
                     let mut keys: Vec<u64> = (0..iters).collect();
                     keys.shuffle(&mut thread_rng());
 
-                    let cpus = num_cpus::get();
                     let per_thread_kv = keys.len() / cpus + 1;
 
                     let mut keys_per_thread = Vec::new();
@@ -63,7 +64,6 @@ pub fn concurrent(c: &mut Criterion) {
                     let mut keys: Vec<u64> = (0..iters).collect();
                     keys.shuffle(&mut thread_rng());
 
-                    let cpus = num_cpus::get();
                     let per_thread_kv = keys.len() / cpus + 1;
 
                     let mut keys_per_thread = Vec::new();
@@ -108,7 +108,6 @@ pub fn concurrent(c: &mut Criterion) {
                     }
 
                     keys.shuffle(&mut thread_rng());
-                    let cpus = num_cpus::get();
                     let per_thread_kv = keys.len() / cpus + 1;
                     let mut keys_per_thread = Vec::new();
                     for tid in 0..cpus {
